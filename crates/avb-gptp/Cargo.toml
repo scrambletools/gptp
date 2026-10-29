@@ -1,0 +1,14 @@
+[package]
+name = "avb-gptp"
+description = "IEEE 802.1AS gPTP: messages, and a time-aware relay's state machines, without I/O"
+version = "0.1.0"
+categories = ["network-programming", "no-std"]
+keywords = ["avb", "tsn", "gptp", "ptp", "802-1as"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
