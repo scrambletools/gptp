@@ -1,0 +1,27 @@
+[Unit]
+Description=AVB bridge: gPTP (802.1AS) time-aware relay on the switch ports
+After=network-online.target
+Wants=network-online.target
+# One gPTP daemon at a time: starting this one stops linuxptp's, and
+# starting gptp-bridge stops this one.
+Conflicts=gptp-bridge.service gptp-phc2sys.service
+# However often it fails, start it again: an unattended bridge without
+# gPTP stops every stream through it.
+StartLimitIntervalSec=0
+
+[Service]
+# enp1s0 is the uplink to a LAN without AVB: no gPTP there, but its clock
+# is the LocalClock, as no loop test resets that card. A port runs only
+# while it is in br0, so one taken out for a loop test is left be.
+ExecStart=/usr/local/sbin/avb-gptpd --bridge br0 --clock enp1s0 enp2s0 enp3s0 enp4s0 enp5s0 enp6s0
+RuntimeDirectory=avb-gptpd
+Restart=on-failure
+# Back before neighbors give up on it: after 3 unanswered Pdelay requests,
+# 3 s, a neighbor counts the link not asCapable and fails every stream
+# crossing it.
+RestartSec=1
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
