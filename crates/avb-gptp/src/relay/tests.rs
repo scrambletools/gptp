@@ -310,16 +310,16 @@ impl Bench {
 }
 
 #[test]
-fn a_grandmasters_time_is_relayed_on_every_master_port() {
+fn a_grandmasters_time_is_relayed_on_every_timetransmitter_port() {
     let mut bench = Bench::new(std::vec![
         grandmaster(),
         endpoint(2, 0x30),
         endpoint(3, 0x40)
     ]);
     bench.run(Duration::from_secs(10));
-    assert_eq!(bench.relay.role(1), Some(Role::Slave));
-    assert_eq!(bench.relay.role(2), Some(Role::Master));
-    assert_eq!(bench.relay.role(3), Some(Role::Master));
+    assert_eq!(bench.relay.role(1), Some(Role::TimeReceiver));
+    assert_eq!(bench.relay.role(2), Some(Role::TimeTransmitter));
+    assert_eq!(bench.relay.role(3), Some(Role::TimeTransmitter));
     let gm = grandmaster();
     assert_eq!(
         bench.relay.grandmaster().map(|system| system.clock),
@@ -405,7 +405,7 @@ fn with_no_grandmaster_the_relay_announces_itself_and_sends_no_sync() {
     let mut bench = Bench::new(std::vec![endpoint(1, 0x10), endpoint(2, 0x30)]);
     bench.run(Duration::from_secs(6));
     assert_eq!(bench.relay.grandmaster(), None);
-    assert_eq!(bench.relay.role(1), Some(Role::Master));
+    assert_eq!(bench.relay.role(1), Some(Role::TimeTransmitter));
     let announce = bench
         .sent_on(1, MessageType::Announce, Duration::from_secs(4))
         .last()
@@ -451,9 +451,9 @@ fn a_better_grandmaster_on_another_port_takes_over() {
     bench.neighbors[1].announces = Some((better, 0, std::vec![better.clock]));
     bench.neighbors[1].syncs = true;
     bench.run(Duration::from_secs(9));
-    assert_eq!(bench.relay.role(2), Some(Role::Slave));
-    assert_eq!(bench.relay.role(1), Some(Role::Master));
-    assert_eq!(bench.relay.role(3), Some(Role::Master));
+    assert_eq!(bench.relay.role(2), Some(Role::TimeReceiver));
+    assert_eq!(bench.relay.role(1), Some(Role::TimeTransmitter));
+    assert_eq!(bench.relay.role(3), Some(Role::TimeTransmitter));
     assert!(bench.events().contains(&Event::Grandmaster(Some(better))));
 }
 
@@ -471,17 +471,17 @@ fn a_grandmaster_gone_quiet_ages_out() {
     assert_eq!(bench.relay.grandmaster(), None);
     assert!(bench.events().contains(&Event::Grandmaster(None)));
     // The relay announces itself on both ports again.
-    assert_eq!(bench.relay.role(1), Some(Role::Master));
+    assert_eq!(bench.relay.role(1), Some(Role::TimeTransmitter));
 }
 
 #[test]
-fn a_grandmaster_that_stops_syncing_loses_the_slave_port_until_its_next_announce() {
+fn a_grandmaster_that_stops_syncing_loses_the_timereceiver_port_until_its_next_announce() {
     let mut bench = Bench::new(std::vec![grandmaster(), endpoint(2, 0x30)]);
     bench.run(Duration::from_millis(6_500));
     bench.events();
     bench.neighbors[0].syncs = false;
     // The last Sync came at 6.5 s: three Sync intervals on, at 6.875 s,
-    // the slave port's information ages.
+    // the timereceiver port's information ages.
     bench.run(Duration::from_millis(6_750));
     assert!(bench.relay.grandmaster().is_some(), "375 ms not yet past");
     bench.run(Duration::from_millis(6_875));

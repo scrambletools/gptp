@@ -1,8 +1,8 @@
 //! A time-aware relay (802.1AS-2020 clause 10, on clause 11's links): the
-//! BMCA choosing the grandmaster and each port's role from the Announce
-//! messages heard, Announce sent on the master ports, and each Sync from
-//! the grandmaster carried on to them with its Follow_Up corrected for
-//! the upstream link and the time it spent here.
+//! BTCA choosing the grandmaster and each port's role from the Announce
+//! messages heard, Announce sent on the timetransmitter ports, and each
+//! Sync from the grandmaster carried on to them with its Follow_Up
+//! corrected for the upstream link and the time it spent here.
 //!
 //! The relay never needs the grandmaster's time on a clock of its own:
 //! a Sync's residence is its departure on one port's time stamp less its
@@ -26,7 +26,7 @@ use crate::message::{
     PortIdentity, Timestamp, Tlv,
 };
 
-/// A system's identity as the BMCA ranks it (802.1AS-2020 10.3.2): field
+/// A system's identity as the BTCA ranks it (802.1AS-2020 10.3.2): field
 /// by field, lower first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SystemIdentity {
@@ -80,9 +80,9 @@ pub enum Role {
     /// Down, or its neighbor not asCapable.
     Disabled,
     /// Towards the grandmaster: its Sync is relayed from here.
-    Slave,
+    TimeReceiver,
     /// Away from the grandmaster: Announce and Sync go out here.
-    Master,
+    TimeTransmitter,
     /// A better path to the grandmaster than this system's lies beyond.
     Passive,
 }
@@ -96,7 +96,8 @@ pub struct Config {
     pub log_sync_interval: i8,
     /// Announce intervals without one before a port's information ages.
     pub announce_receipt_timeout: u8,
-    /// Sync intervals without one before the slave port's information ages.
+    /// Sync intervals without one before the timereceiver port's
+    /// information ages.
     pub sync_receipt_timeout: u8,
 }
 
@@ -148,8 +149,8 @@ struct Information {
     expires: Duration,
 }
 
-/// A Sync sent on a master port, waiting for the time it left and the
-/// upstream Follow_Up it relays.
+/// A Sync sent on a timetransmitter port, waiting for the time it left
+/// and the upstream Follow_Up it relays.
 #[derive(Debug, Clone, Copy)]
 struct Relaying {
     sequence: u16,
@@ -157,7 +158,7 @@ struct Relaying {
     sent: Option<i128>,
 }
 
-/// The slave port's last Sync and, once it comes, its Follow_Up.
+/// The timereceiver port's last Sync and, once it comes, its Follow_Up.
 #[derive(Debug, Clone, Copy)]
 struct Upstream {
     sequence: u16,
@@ -172,7 +173,8 @@ struct FollowedUp {
     information: FollowUpInformation,
     /// The grandmaster's rate over the LocalClock's.
     rate_ratio: f64,
-    /// The upstream link's delay on the LocalClock, from the slave port.
+    /// The upstream link's delay on the LocalClock, from the timereceiver
+    /// port.
     link_delay: f64,
 }
 
@@ -194,7 +196,7 @@ pub struct Relay {
     config: Config,
     ports: Vec<Port>,
     root: PriorityVector,
-    slave: Option<u16>,
+    receiver: Option<u16>,
     upstream: Option<Upstream>,
     sync_expires: Option<Duration>,
     outgoing: VecDeque<Transmit>,
@@ -237,7 +239,7 @@ impl Relay {
             config,
             ports,
             root: own_vector(&config),
-            slave: None,
+            receiver: None,
             upstream: None,
             sync_expires: None,
             outgoing: VecDeque::new(),
@@ -369,9 +371,10 @@ impl Relay {
         }
         if self.sync_expires.is_some_and(|expires| expires <= now) {
             // 802.1AS-2020 10.3.11: no Sync from the grandmaster for too
-            // long ages the slave port's information as no Announce would.
+            // long ages the timereceiver port's information as no Announce
+            // would.
             self.sync_expires = None;
-            if let Some(index) = self.slave.and_then(|slave| self.index(slave)) {
+            if let Some(index) = self.receiver.and_then(|receiver| self.index(receiver)) {
                 self.ports[index].information = None;
                 reselect = true;
             }
@@ -414,7 +417,7 @@ impl Relay {
 
     /// The grandmaster, if one is present.
     pub fn grandmaster(&self) -> Option<SystemIdentity> {
-        (self.slave.is_some() && self.root.root.priority1 < 255).then_some(self.root.root)
+        (self.receiver.is_some() && self.root.root.priority1 < 255).then_some(self.root.root)
     }
 
     /// The grandmaster's rate over the LocalClock's, from the last
@@ -481,7 +484,7 @@ impl Relay {
 
     fn receive_sync(&mut self, now: Duration, index: usize, message: &Message, received: i128) {
         let port = &self.ports[index];
-        if self.slave != Some(port.number)
+        if self.receiver != Some(port.number)
             || !port.as_capable
             || !message.header.flags.two_step()
             || port
@@ -503,7 +506,7 @@ impl Relay {
         });
         for index in 0..self.ports.len() {
             let port = &mut self.ports[index];
-            if port.role != Role::Master {
+            if port.role != Role::TimeTransmitter {
                 continue;
             }
             port.sync_sequence = port.sync_sequence.wrapping_add(1);
@@ -539,7 +542,7 @@ impl Relay {
         let Some(upstream) = self.upstream.as_mut() else {
             return;
         };
-        if self.slave != Some(port.number)
+        if self.receiver != Some(port.number)
             || upstream.sequence != message.header.sequence_id
             || port
                 .information
@@ -620,7 +623,7 @@ impl Relay {
 
     fn send_announce(&mut self, now: Duration, index: usize) {
         let port = &mut self.ports[index];
-        if port.role != Role::Master {
+        if port.role != Role::TimeTransmitter {
             port.next_announce = None;
             return;
         }
@@ -628,12 +631,12 @@ impl Relay {
         port.announce_sequence = port.announce_sequence.wrapping_add(1);
         let (number, sequence) = (port.number, port.announce_sequence);
         let own = self.config.identity.clock;
-        let slave = self
-            .slave
-            .and_then(|slave| self.index(slave))
-            .and_then(|slave| self.ports[slave].information.as_ref());
+        let heard = self
+            .receiver
+            .and_then(|receiver| self.index(receiver))
+            .and_then(|receiver| self.ports[receiver].information.as_ref());
         let root = self.root.root;
-        let (announce, flags, mut path) = match slave {
+        let (announce, flags, mut path) = match heard {
             Some(information) => (
                 Announce {
                     steps_removed: self.root.steps_removed,
@@ -711,9 +714,9 @@ impl Relay {
         true
     }
 
-    /// The BMCA (802.1AS-2020 10.3.12): the best of this system and what
-    /// each asCapable port heard decides the grandmaster, the slave port
-    /// and every other port's role.
+    /// The BTCA (802.1AS-2020 10.3.12): the best of this system and what
+    /// each asCapable port heard decides the grandmaster, the timereceiver
+    /// port and every other port's role.
     fn select(&mut self, now: Duration) {
         let own = own_vector(&self.config);
         let best = self
@@ -728,25 +731,25 @@ impl Relay {
             .chain([own])
             .min()
             .expect("own vector");
-        let slave = (best != own).then_some(best.port);
+        let receiver = (best != own).then_some(best.port);
         let old_grandmaster = self.grandmaster();
-        if slave != self.slave {
+        if receiver != self.receiver {
             self.upstream = None;
-            self.sync_expires = slave.map(|_| {
+            self.sync_expires = receiver.map(|_| {
                 now + interval(self.config.log_sync_interval)
                     * u32::from(self.config.sync_receipt_timeout)
             });
         }
         self.root = best;
-        self.slave = slave;
+        self.receiver = receiver;
         let clock = self.config.identity.clock;
         for port in &mut self.ports {
             let role = if !port.as_capable {
                 Role::Disabled
-            } else if Some(port.number) == slave {
-                Role::Slave
+            } else if Some(port.number) == receiver {
+                Role::TimeReceiver
             } else {
-                let master = PriorityVector {
+                let transmitted = PriorityVector {
                     source: PortIdentity {
                         clock,
                         port: port.number,
@@ -755,14 +758,14 @@ impl Relay {
                     ..best
                 };
                 match &port.information {
-                    Some(information) if information.vector < master => Role::Passive,
-                    _ => Role::Master,
+                    Some(information) if information.vector < transmitted => Role::Passive,
+                    _ => Role::TimeTransmitter,
                 }
             };
             if role != port.role {
                 port.role = role;
                 port.relaying = None;
-                port.next_announce = (role == Role::Master).then_some(now);
+                port.next_announce = (role == Role::TimeTransmitter).then_some(now);
                 self.events.push_back(Event::Role {
                     port: port.number,
                     role,

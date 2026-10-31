@@ -75,7 +75,7 @@ fn ethernet_padding_after_the_message_is_left_behind() {
 }
 
 #[test]
-fn an_announce_reads_as_the_bmca_compares_it() {
+fn an_announce_reads_as_the_btca_compares_it() {
     let received = recorded("switch announce");
     let message = Message::decode(&received).expect("announce");
     let grandmaster = ClockIdentity(0x000a_92ff_fe02_6e05);

@@ -24,7 +24,7 @@ pub const PATH_TRACE: u16 = 0x0008;
 pub const IEEE_802_1: u32 = 0x0080c2;
 
 /// IEEE 1588's identity of a clock, its EUI-64. It orders as its octets
-/// do, as the BMCA compares identities.
+/// do, as the BTCA compares identities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct ClockIdentity(pub u64);
 
