@@ -61,29 +61,51 @@ root port lacks Precision Time Measurement, so the PHCs offer no cross
 time stamping (`phc_ctl caps`: "doesn't have cross timestamping
 support").
 
-So `avb-gptpd` makes one LocalClock out of them:
+So `avb-gptpd` makes one LocalClock over them, in software:
 
-- One port's PHC is the reference. It runs free: the daemon never adjusts
-  it.
-- Every other port's PHC follows the reference, in frequency and phase,
-  from paired readings of both against the system's monotonic clock
-  (`PTP_SYS_OFFSET_EXTENDED`), filtered. The loop only slews, and only
-  by the crystals' difference, a steady few ppm that a neighbor measures
-  as a fixed rate, which 802.1AS allows.
-- When the daemon starts, it steps every PHC onto the reference once,
-  before any port sends or answers a gPTP message. Nothing steps after
-  that.
+- Each port's PHC stamps that port's messages, and its neighbor sees only
+  that clock. No PHC is stepped or slewed, ever: each runs at its own
+  crystal's rate, a fixed few ppm from nominal as 802.1AS allows, with
+  any adjustment linuxptp left taken off as the daemon starts.
+- One PHC is the LocalClock, on the bench the uplink's, which carries no
+  gPTP. Every port's PHC is compared with it ten times a second, each
+  against the system clock between two of its readings
+  (`PTP_SYS_OFFSET_EXTENDED`), and the rate between the two followed
+  over the last two seconds. Each time stamp is then put on the
+  LocalClock as the two clocks stood when it was taken.
+- The relay takes each time stamp on both clocks, with the port clock's
+  rate over the LocalClock's. A port's link is measured on its own
+  clock; the residence is departure less arrival on the LocalClock; the
+  rate ratio a Follow_Up carries out of a port is the grandmaster's over
+  that port's clock, the one its neighbor measures.
+- A card reset sets its PHC again. A comparison far from what the last
+  ones foretold, read twice so that a misread is not taken for one,
+  starts that port's comparison afresh. The neighbor on that port sees
+  the jump, as the hardware made it; no other neighbor does.
+- Taking over from linuxptp, each port's PHC goes on from where phc2sys
+  left it, so its neighbor sees no step there either, only the rate
+  changing by a few ppm.
 - The grandmaster's time never touches the PHCs. The relay carries it as
   802.1AS does: the rate ratio of the grandmaster to the LocalClock,
   built from each upstream link's neighbor rate ratio and the
   grandmaster's cumulative rate ratio in Follow_Up, and the correction
   each Sync carries.
 
-The alignment loop's error adds to every residence time. The target is
-under 100 ns, measured on the bench before the relay depends on it.
-Anything that later needs the grandmaster's time on a PHC, such as launch
-times for a credit-based shaper, converts from the LocalClock with the
-relay's offset and rate, rather than moving a clock.
+This replaces a first plan, a loop slewing each PHC onto a reference: the
+comparison is the same, but putting the times on one clock in software
+moves no clock at all, and so leaves nothing for a neighbor to see. A
+second, every port sending the LocalClock's times, would have shown the
+neighbors a step when taking over from linuxptp, and whenever the
+LocalClock's card was reset.
+
+The comparison's error adds to every residence time. The target is under
+100 ns: `avb-residence` measured the same comparison at a standard
+deviation under 50 ns, and the grandmaster time `avb-gptpd` worked out
+from each Sync, on one port against ptp4l's, stood -6 ns from ptp4l's
+with a standard deviation of 59 ns. Anything
+that later needs the grandmaster's time on a PHC, such as launch times
+for a credit-based shaper, converts from the LocalClock with the relay's
+offset and rate, rather than moving a clock.
 
 ## The protocol
 
@@ -97,20 +119,22 @@ relay's offset and rate, rather than moving a clock.
   plausible range, and an implausible one is dropped while the last good
   ratio is kept for up to three intervals, so a neighbor's own clock step
   costs one measurement rather than asCapable.
-- **Announce and the BMCA (10.3):** per-port announce receipt and
+- **Announce and the BTCA (10.3):** per-port announce receipt and
   information, the system's priority vector from the best Announce, port
-  roles (SlavePort, MasterPort, PassivePort, DisabledPort), stepsRemoved,
-  and the path trace TLV. Announce is sent per MasterPort from the
-  system's own priority vector, not forwarded.
+  roles (timereceiver, timetransmitter, passive and disabled ports),
+  stepsRemoved, and the path trace TLV. Announce is sent per
+  timetransmitter port from the system's own priority vector, not
+  forwarded.
 - **Sync relay (10.2 and 11.2):** a Sync and its Follow_Up received on
-  the SlavePort go out on every MasterPort at once, two-step. The
+  the timereceiver port go out on every timetransmitter port at once,
+  two-step. The
   Follow_Up keeps preciseOriginTimestamp, adds the upstream link delay
   and the residence time to the correction (both scaled to the
   grandmaster's rate), and updates cumulativeScaledRateOffset with the
   upstream link's neighbor rate ratio. Sync receipt timeout is 3 Sync
   intervals.
 - **Signaling (10.6.4):** honoring a neighbor's message interval request
-  TLV, as the ESP boards send.
+  TLV, as the ESP boards send. Not done yet: the relay ignores them.
 
 What the bench taught, carried into the design:
 
@@ -136,11 +160,13 @@ simulated clocks, and leaves it usable without `std`.
 - A raw socket per port for ethertype 0x88F7, with hardware time
   stamping on (transmit on, receive filter all, as ptp4l sets today);
   transmit times come back on the error queue.
-- The PHC alignment loop above.
+- The LocalClock above.
 - One thread running `avb-gptp`, its sockets and its timers.
 - Its state for people and for `avb-bridged` in
   `/run/avb-gptpd/status`: per port asCapable, role, link delay, rate
-  ratio; the grandmaster, the offset and rate to it.
+  ratio; the grandmaster, its time and rate against the LocalClock.
+- A port runs only while it is in the bridge, so a port taken out for a
+  loop test is left be.
 - A systemd unit that conflicts with `gptp-bridge.service` and
   `gptp-phc2sys.service`, so one command switches between linuxptp and
   the relay, and back.
@@ -152,11 +178,13 @@ Hardware time stamping and PHC adjustment go into `avb-net`, next to its
 
 - **Unit tests** in `avb-gptp`: messages from today's captures (the
   PreSonus, the 8D, the Mac and the ESP boards) parse and rebuild byte
-  for byte; link, BMCA and relay state machines against scripted
+  for byte; link, BTCA and relay state machines against scripted
   neighbors with simulated clocks, including rate offsets, a neighbor's
   step, a grandmaster's departure and return, and a boot.
-- **Two daemons back to back** on a veth pair or two spare ports, with
-  software time stamps, for the plumbing.
+- **One port against ptp4l:** `avb-gptpd` on the loop port, with ptp4l
+  on the bridge port at the far end, its grandmaster time checked
+  against the far port's PHC, which ptp4l and phc2sys keep on the
+  grandmaster's time.
 - **Bench windows** agreed with the ESP session: `avb-gptpd` replaces
   ptp4l on scrambox, then the boards' own offsets and asCapable, the
   PreSonus's Sync, and captures of our Follow_Up corrections against the
@@ -168,11 +196,11 @@ Hardware time stamping and PHC adjustment go into `avb-net`, next to its
 1. `avb-gptp`: the messages and TLVs, encoded and decoded, tested on
    recorded frames.
 2. The link: Pdelay requester and responder, rate ratio, asCapable.
-3. Announce, the BMCA and port roles.
+3. Announce, the BTCA and port roles.
 4. The Sync relay and the time arithmetic.
 5. `avb-net`: hardware time stamps on raw sockets, PHC frequency and
    offset reads.
-6. `avb-gptpd`: the alignment loop, the event loop, the status file, the
+6. `avb-gptpd`: the LocalClock, the event loop, the status file, the
    unit and the switch.
 7. `avb-bridged` on `avb-gptpd`'s asCapable.
 8. Bench windows, then a release.
