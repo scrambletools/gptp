@@ -28,11 +28,30 @@ pub const IEEE_802_1: u32 = 0x0080c2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct ClockIdentity(pub u64);
 
+/// As linuxptp shows it: `000a92.fffe.026e05`.
+impl fmt::Display for ClockIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let octets = self.0.to_be_bytes();
+        write!(
+            formatter,
+            "{:02x}{:02x}{:02x}.{:02x}{:02x}.{:02x}{:02x}{:02x}",
+            octets[0], octets[1], octets[2], octets[3], octets[4], octets[5], octets[6], octets[7]
+        )
+    }
+}
+
 /// A clock's port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct PortIdentity {
     pub clock: ClockIdentity,
     pub port: u16,
+}
+
+/// As linuxptp shows it: `000a92.fffe.026e05-1`.
+impl fmt::Display for PortIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}-{}", self.clock, self.port)
+    }
 }
 
 /// A PTP timestamp: 48 bits of seconds and the nanoseconds within one.

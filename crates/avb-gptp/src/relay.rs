@@ -6,10 +6,11 @@
 //!
 //! The relay never needs the grandmaster's time on a clock of its own:
 //! a Sync's residence is its departure on one port's time stamp less its
-//! arrival on another's, both on the caller's free-running LocalClock,
-//! scaled to the grandmaster's rate with the rate ratio the Follow_Up
-//! brings and the upstream link measured. So nothing the network does
-//! moves a clock that a neighbor measures.
+//! arrival on another's, both put on the caller's free-running
+//! LocalClock, scaled to the grandmaster's rate with the rate ratio the
+//! Follow_Up brings and the upstream link measured. Each port's own
+//! clock, which may be another, stamps what its neighbor sees, so nothing
+//! the network does moves a clock that a neighbor measures.
 //!
 //! It is not grandmaster capable: when no Announce names a grandmaster
 //! better than this system's own priority, the relay announces itself, as
@@ -114,6 +115,28 @@ impl Config {
     }
 }
 
+/// When an event message crossed a port's wire: on the port's own clock,
+/// as its neighbor sees it, and the same moment on the LocalClock, with
+/// the port clock's rate over the LocalClock's. A port whose clock is the
+/// LocalClock has [`Stamp::local`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Stamp {
+    pub port: i128,
+    pub local: i128,
+    pub rate: f64,
+}
+
+impl Stamp {
+    /// A time on a port whose clock is the LocalClock.
+    pub fn local(time: i128) -> Self {
+        Self {
+            port: time,
+            local: time,
+            rate: 1.0,
+        }
+    }
+}
+
 /// A frame to send on a port, the octets after its Ethernet header, and
 /// the message whose departure the caller is to report with
 /// [`Relay::handle_transmit_time`], if it is an event message.
@@ -155,14 +178,14 @@ struct Information {
 struct Relaying {
     sequence: u16,
     upstream: u16,
-    sent: Option<i128>,
+    sent: Option<Stamp>,
 }
 
 /// The timereceiver port's last Sync and, once it comes, its Follow_Up.
 #[derive(Debug, Clone, Copy)]
 struct Upstream {
     sequence: u16,
-    received: i128,
+    received: Stamp,
     follow_up: Option<FollowedUp>,
 }
 
@@ -198,6 +221,10 @@ pub struct Relay {
     root: PriorityVector,
     receiver: Option<u16>,
     upstream: Option<Upstream>,
+    /// The last Sync from the grandmaster whose Follow_Up came: when it
+    /// arrived, and what the Follow_Up said. It stands while the next
+    /// Sync waits for its own.
+    synced: Option<(i128, FollowedUp)>,
     sync_expires: Option<Duration>,
     outgoing: VecDeque<Transmit>,
     events: VecDeque<Event>,
@@ -241,6 +268,7 @@ impl Relay {
             root: own_vector(&config),
             receiver: None,
             upstream: None,
+            synced: None,
             sync_expires: None,
             outgoing: VecDeque::new(),
             events: VecDeque::new(),
@@ -265,9 +293,9 @@ impl Relay {
     }
 
     /// A frame heard on port `number`, the octets after the Ethernet
-    /// header, and when it arrived on the LocalClock (for event messages
-    /// the hardware time stamp; others need none).
-    pub fn handle_frame(&mut self, now: Duration, number: u16, frame: &[u8], received: i128) {
+    /// header, and when it arrived (for event messages the hardware time
+    /// stamp; others need none).
+    pub fn handle_frame(&mut self, now: Duration, number: u16, frame: &[u8], received: Stamp) {
         let Ok(message) = Message::decode(frame) else {
             return;
         };
@@ -286,7 +314,10 @@ impl Relay {
         }
         match message.message_type() {
             MessageType::PdelayReq | MessageType::PdelayResp | MessageType::PdelayRespFollowUp => {
-                if let Some(transmit) = self.ports[index].link.handle_message(&message, received) {
+                if let Some(transmit) = self.ports[index]
+                    .link
+                    .handle_message(&message, received.port)
+                {
                     self.queue(number, &transmit.message, transmit.stamp);
                 }
                 self.check_capable(now, number);
@@ -299,13 +330,13 @@ impl Relay {
     }
 
     /// The time a frame the relay asked to have stamped left port
-    /// `number`, on the LocalClock.
+    /// `number`.
     pub fn handle_transmit_time(
         &mut self,
         number: u16,
         message_type: MessageType,
         sequence: u16,
-        time: i128,
+        time: Stamp,
     ) {
         let Some(index) = self.index(number) else {
             return;
@@ -325,7 +356,7 @@ impl Relay {
                 if let Some(transmit) =
                     self.ports[index]
                         .link
-                        .handle_transmit_time(message_type, sequence, time)
+                        .handle_transmit_time(message_type, sequence, time.port)
                 {
                     self.queue(number, &transmit.message, transmit.stamp);
                 }
@@ -423,15 +454,14 @@ impl Relay {
     /// The grandmaster's rate over the LocalClock's, from the last
     /// Follow_Up relayed.
     pub fn rate_ratio(&self) -> Option<f64> {
-        self.upstream?.follow_up.map(|followed| followed.rate_ratio)
+        self.synced.map(|(_, followed)| followed.rate_ratio)
     }
 
     /// The grandmaster's time, in nanoseconds, when the LocalClock reads
     /// `local`, from the last Sync and Follow_Up heard.
     pub fn grandmaster_time(&self, local: i128) -> Option<i128> {
-        let upstream = self.upstream?;
-        let followed = upstream.follow_up?;
-        let since = (local - upstream.received) as f64 + followed.link_delay;
+        let (received, followed) = self.synced?;
+        let since = (local - received) as f64 + followed.link_delay;
         Some(
             followed.precise_origin.nanos()
                 + correction_nanos(followed.correction)
@@ -482,7 +512,7 @@ impl Relay {
         }
     }
 
-    fn receive_sync(&mut self, now: Duration, index: usize, message: &Message, received: i128) {
+    fn receive_sync(&mut self, now: Duration, index: usize, message: &Message, received: Stamp) {
         let port = &self.ports[index];
         if self.receiver != Some(port.number)
             || !port.as_capable
@@ -556,13 +586,18 @@ impl Relay {
         };
         let information = message.follow_up_information().unwrap_or_default();
         let upstream_rate = 1.0 + f64::from(information.cumulative_scaled_rate_offset) / RATE_SCALE;
-        upstream.follow_up = Some(FollowedUp {
+        // The link measured on the port's clock: the neighbor's rate over
+        // it, and the delay in its time.
+        let port_rate = upstream.received.rate;
+        let followed = FollowedUp {
             precise_origin,
             correction: message.header.correction,
             information,
-            rate_ratio: upstream_rate * measured.neighbor_rate_ratio,
-            link_delay: measured.mean_link_delay,
-        });
+            rate_ratio: upstream_rate * measured.neighbor_rate_ratio * port_rate,
+            link_delay: measured.mean_link_delay / port_rate,
+        };
+        upstream.follow_up = Some(followed);
+        self.synced = Some((upstream.received.local, followed));
         for index in 0..self.ports.len() {
             self.send_follow_up(index);
         }
@@ -592,11 +627,14 @@ impl Relay {
         // 802.1AS-2020 11.2.15.2.1: the correction grows by the time since
         // the upstream system sent the Sync, the link delay and the
         // residence here, on the grandmaster's time base.
-        let elapsed = (sent - upstream.received) as f64 + followed.link_delay;
+        let elapsed = (sent.local - upstream.received.local) as f64 + followed.link_delay;
         let added = elapsed * followed.rate_ratio * CORRECTION_SCALE;
         let correction = followed.correction.saturating_add(added as i64);
+        // The neighbor measures this port's clock, so the rate ratio it
+        // takes on is the grandmaster's over that clock.
         let information = FollowUpInformation {
-            cumulative_scaled_rate_offset: ((followed.rate_ratio - 1.0) * RATE_SCALE) as i32,
+            cumulative_scaled_rate_offset: ((followed.rate_ratio / sent.rate - 1.0) * RATE_SCALE)
+                as i32,
             ..followed.information
         };
         let mut tlv = [0; 32];
@@ -735,6 +773,7 @@ impl Relay {
         let old_grandmaster = self.grandmaster();
         if receiver != self.receiver {
             self.upstream = None;
+            self.synced = None;
             self.sync_expires = receiver.map(|_| {
                 now + interval(self.config.log_sync_interval)
                     * u32::from(self.config.sync_receipt_timeout)

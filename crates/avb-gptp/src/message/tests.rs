@@ -1,4 +1,5 @@
 use super::*;
+use std::string::ToString;
 use std::vec::Vec;
 
 fn octets(hex: &str) -> Vec<u8> {
@@ -44,6 +45,16 @@ fn recorded(name: &str) -> Vec<u8> {
         .find(|(each, _)| *each == name)
         .expect("recorded");
     octets(hex)
+}
+
+#[test]
+fn identities_show_as_linuxptp_shows_them() {
+    let clock = ClockIdentity(0x000a_92ff_fe02_6e05);
+    assert_eq!(clock.to_string(), "000a92.fffe.026e05");
+    assert_eq!(
+        PortIdentity { clock, port: 1 }.to_string(),
+        "000a92.fffe.026e05-1"
+    );
 }
 
 #[test]

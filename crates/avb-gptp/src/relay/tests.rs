@@ -113,6 +113,9 @@ impl Sent {
 struct Bench {
     relay: Relay,
     neighbors: Vec<Neighbor>,
+    /// Each port's clock: from what offset, and at what rate times the
+    /// LocalClock's, it runs.
+    clocks: [(i128, f64); 3],
     now: Duration,
     sent: Vec<Sent>,
     sequence: u16,
@@ -120,9 +123,14 @@ struct Bench {
 
 impl Bench {
     fn new(neighbors: Vec<Neighbor>) -> Self {
+        Self::with_clocks(neighbors, [(0, 1.0); 3])
+    }
+
+    fn with_clocks(neighbors: Vec<Neighbor>, clocks: [(i128, f64); 3]) -> Self {
         let mut bench = Self {
             relay: Relay::new(Config::new(ours()), 3),
             neighbors,
+            clocks,
             now: Duration::ZERO,
             sent: Vec::new(),
             sequence: 0,
@@ -165,11 +173,22 @@ impl Bench {
         }
     }
 
+    /// A moment on the LocalClock as port `port`'s clock stamps it.
+    fn stamp(&self, port: u16, local: i128) -> Stamp {
+        let (offset, rate) = self.clocks[usize::from(port) - 1];
+        Stamp {
+            port: offset + (local as f64 * rate) as i128,
+            local,
+            rate,
+        }
+    }
+
     fn deliver(&mut self, port: u16, message: &Message, received: i128) {
         let mut frame = [0; 128];
         let length = message.encode(&mut frame).expect("encodes");
+        let stamp = self.stamp(port, received);
         self.relay
-            .handle_frame(self.now, port, &frame[..length], received);
+            .handle_frame(self.now, port, &frame[..length], stamp);
         self.drain();
     }
 
@@ -240,8 +259,9 @@ impl Bench {
         while let Some(transmit) = self.relay.poll_transmit() {
             let left = transmit.stamp.map(|_| local(self.now) + TRANSMIT_LATENCY);
             if let (Some((message_type, sequence)), Some(left)) = (transmit.stamp, left) {
+                let stamp = self.stamp(transmit.port, left);
                 self.relay
-                    .handle_transmit_time(transmit.port, message_type, sequence, left);
+                    .handle_transmit_time(transmit.port, message_type, sequence, stamp);
             }
             let request = Message::decode(&transmit.frame).expect("decodes");
             if let (MessageType::PdelayReq, Some(neighbor), Some(t1)) = (
@@ -364,6 +384,75 @@ fn a_grandmasters_time_is_relayed_on_every_timetransmitter_port() {
     let local_now = local(bench.now);
     let time = bench.relay.grandmaster_time(local_now).expect("time");
     assert!((time - gm.clock(local_now)).abs() <= 3);
+}
+
+#[test]
+fn each_ports_own_clock_stamps_what_its_neighbor_sees() {
+    // The timereceiver port's clock 5 s ahead of the LocalClock and 20 ppm
+    // fast, port 2's 7 s behind and 30 ppm slow.
+    let slow = 1.0 - 30e-6;
+    let mut bench = Bench::with_clocks(
+        std::vec![grandmaster(), endpoint(2, 0x30), endpoint(3, 0x40)],
+        [(5 * SECOND, 1.0 + 20e-6), (-7 * SECOND, slow), (0, 1.0)],
+    );
+    bench.run(Duration::from_secs(10));
+    let gm = grandmaster();
+    let neighbor = bench.neighbor(2).expect("a neighbor").clone();
+    let link = bench.relay.link(2).expect("measured");
+    assert!((link.neighbor_rate_ratio - neighbor.rate / slow).abs() < 1e-9);
+
+    let after = Duration::from_secs(6);
+    let syncs: Vec<_> = bench.sent_on(2, MessageType::Sync, after).collect();
+    let follow_ups: Vec<_> = bench.sent_on(2, MessageType::FollowUp, after).collect();
+    assert!(follow_ups.len() >= 20, "{} follow ups", follow_ups.len());
+    for follow_up in &follow_ups {
+        let message = follow_up.message();
+        let sync = syncs
+            .iter()
+            .find(|sync| sync.message().header.sequence_id == message.header.sequence_id)
+            .expect("its sync");
+        let Body::FollowUp { precise_origin } = message.body else {
+            panic!("not a follow up");
+        };
+        let said = precise_origin.nanos() + correction_nanos(message.header.correction);
+        let actual = gm.clock(sync.left.expect("stamped"));
+        assert!((said - actual).abs() <= 3, "off by {} ns", said - actual);
+        // The rate the neighbor takes on is the grandmaster's over port 2's
+        // clock, the one it measures.
+        let information = message.follow_up_information().expect("information");
+        let rate = 1.0 + f64::from(information.cumulative_scaled_rate_offset) / RATE_SCALE;
+        assert!((rate - gm.rate / slow).abs() < 1e-9, "rate {rate}");
+    }
+    let local_now = local(bench.now);
+    let time = bench.relay.grandmaster_time(local_now).expect("time");
+    assert!((time - gm.clock(local_now)).abs() <= 3);
+    let rate = bench.relay.rate_ratio().expect("a rate");
+    assert!((rate - gm.rate).abs() < 1e-9, "rate {rate}");
+}
+
+#[test]
+fn the_grandmasters_time_stands_while_a_sync_waits_for_its_follow_up() {
+    let mut bench = Bench::new(std::vec![grandmaster(), endpoint(2, 0x30)]);
+    bench.run(Duration::from_secs(10));
+    let gm = grandmaster();
+    bench.now += Duration::from_millis(125);
+    let sync = Message {
+        header: gm.header(
+            bench.sequence.wrapping_add(1),
+            Flags::TWO_STEP | Flags::PTP_TIMESCALE,
+            0,
+            -3,
+        ),
+        body: Body::Sync {
+            origin: Timestamp::default(),
+        },
+        tlvs: &[],
+    };
+    bench.deliver(gm.port, &sync, local(bench.now));
+    let local_now = local(bench.now);
+    let time = bench.relay.grandmaster_time(local_now).expect("time");
+    assert!((time - gm.clock(local_now)).abs() <= 3);
+    assert!(bench.relay.rate_ratio().is_some());
 }
 
 #[test]
