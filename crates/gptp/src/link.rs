@@ -19,6 +19,32 @@ use core::time::Duration;
 
 use crate::message::{Body, Flags, Header, Message, MessageType, PortIdentity, Timestamp};
 
+/// Why a port is not asCapable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Incapable {
+    Down,
+    Unanswered,
+    MultipleResponders,
+    ImplausibleRate,
+    NoRate,
+    NoDelay,
+    LongDelay,
+}
+
+impl Incapable {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Down => "its link is down",
+            Self::Unanswered => "its requests went unanswered",
+            Self::MultipleResponders => "more than one port answered a request",
+            Self::ImplausibleRate => "the neighbor's rate read implausible",
+            Self::NoRate => "the neighbor's rate is not known yet",
+            Self::NoDelay => "the link delay is not known yet",
+            Self::LongDelay => "the link delay is over the threshold",
+        }
+    }
+}
+
 /// How a port measures its link.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Config {
@@ -34,10 +60,28 @@ pub struct Config {
     /// Implausible rate measurements in a row that keep the last good
     /// ratio before it is dropped too.
     pub allowed_rate_outliers: u8,
-    /// Delay measurements averaged into the mean link delay.
+    /// Delay measurements whose median is the mean link delay.
     pub delay_samples: usize,
+    /// How far, in nanoseconds, a delay measurement may stand from the
+    /// median of those kept before it is taken for a bad time stamp on
+    /// either side and left out.
+    pub delay_outlier: f64,
+    /// Delay measurements in a row left out, after which the link is taken
+    /// to have changed: those kept make way for the new. A neighbor with
+    /// bad time stamps can give several in a row, while a link that really
+    /// changed went down and up, which starts the measurements afresh.
+    pub allowed_delay_outliers: u8,
     /// minorVersionPTP of messages sent: 0, as some switches ignore 1.
     pub minor_version: u8,
+    /// Whether the Pdelay messages sent carry the Endpoint Declaration
+    /// TLV, as an end station supporting AVB Lite says it is one (AVB
+    /// Lite profile 2.1).
+    pub endpoint_declaration: bool,
+    /// Requests in a row each answered by more than one clock, after
+    /// which the port stops asking for `cease_for`, or until the link goes
+    /// down and up (Milan 4.2.6.2.5): a switch is flooding the requests.
+    pub cease_after_multiple: u8,
+    pub cease_for: Duration,
 }
 
 impl Default for Config {
@@ -49,7 +93,12 @@ impl Default for Config {
             plausible_rate: 1000e-6,
             allowed_rate_outliers: 3,
             delay_samples: 8,
+            delay_outlier: 400.0,
+            allowed_delay_outliers: 15,
             minor_version: 0,
+            endpoint_declaration: false,
+            cease_after_multiple: 3,
+            cease_for: Duration::from_secs(300),
         }
     }
 }
@@ -104,11 +153,26 @@ pub struct Link {
     rate: Option<f64>,
     rate_outliers: u8,
     delays: DelayFilter,
+    /// The delay measurements left out in a row, in case the link changed.
+    changed: DelayFilter,
+    delay_outliers: u8,
+    /// The last delay measurement left out, with the median it stood from,
+    /// until taken.
+    outlier: Option<(f64, f64)>,
     neighbor: Option<PortIdentity>,
     multiple_responders: u8,
 }
 
 impl Link {
+    /// The TLVs each Pdelay message sent carries.
+    fn tlvs(&self) -> &'static [u8] {
+        if self.config.endpoint_declaration {
+            &crate::lite::ENDPOINT_TLV
+        } else {
+            &[]
+        }
+    }
+
     pub fn new(own: PortIdentity, config: Config) -> Self {
         Self {
             config,
@@ -123,6 +187,9 @@ impl Link {
             rate: None,
             rate_outliers: 0,
             delays: DelayFilter::new(config.delay_samples),
+            changed: DelayFilter::new(config.delay_samples),
+            delay_outliers: 0,
+            outlier: None,
             neighbor: None,
             multiple_responders: 0,
         }
@@ -151,14 +218,37 @@ impl Link {
             && self.rate.is_some()
             && self
                 .delays
-                .mean()
+                .median()
                 .is_some_and(|delay| delay <= self.config.neighbor_prop_delay_thresh)
+    }
+
+    /// Why the port may not carry gPTP's time, while it may not: the first
+    /// of [`as_capable`](Self::as_capable)'s conditions to fail.
+    pub fn incapable_because(&self) -> Option<Incapable> {
+        let thresh = self.config.neighbor_prop_delay_thresh;
+        if !self.enabled {
+            Some(Incapable::Down)
+        } else if self.lost > self.config.allowed_lost_responses {
+            Some(Incapable::Unanswered)
+        } else if self.multiple_responders > 0 {
+            Some(Incapable::MultipleResponders)
+        } else if self.rate.is_none() && self.rate_outliers > self.config.allowed_rate_outliers {
+            Some(Incapable::ImplausibleRate)
+        } else if self.rate.is_none() {
+            Some(Incapable::NoRate)
+        } else {
+            match self.delays.median() {
+                None => Some(Incapable::NoDelay),
+                Some(delay) if delay > thresh => Some(Incapable::LongDelay),
+                Some(_) => None,
+            }
+        }
     }
 
     /// What is known of the neighbor, once a rate and a delay are.
     pub fn measurement(&self) -> Option<Measurement> {
         Some(Measurement {
-            mean_link_delay: self.delays.mean()?,
+            mean_link_delay: self.delays.median()?,
             neighbor_rate_ratio: self.rate?,
             neighbor: self.neighbor?,
         })
@@ -173,6 +263,12 @@ impl Link {
     /// if nothing whole answered it.
     pub fn handle_timeout(&mut self, now: Duration) -> Option<Transmit> {
         let due = self.next_request.filter(|due| *due <= now)?;
+        if self.multiple_responders >= self.config.cease_after_multiple {
+            self.multiple_responders = 0;
+            self.request = None;
+            self.next_request = Some(now + self.config.cease_for);
+            return None;
+        }
         if self.request.is_some() {
             self.lost = self.lost.saturating_add(1);
             if self.lost > self.config.allowed_lost_responses {
@@ -202,7 +298,7 @@ impl Link {
                     self.config.log_interval,
                 ),
                 body: Body::PdelayReq { reserved: [0; 20] },
-                tlvs: &[],
+                tlvs: self.tlvs(),
             },
             stamp: true,
         })
@@ -241,7 +337,7 @@ impl Link {
                             response_origin: Timestamp::from_nanos(time)?,
                             requesting,
                         },
-                        tlvs: &[],
+                        tlvs: self.tlvs(),
                     },
                     stamp: false,
                 })
@@ -274,7 +370,7 @@ impl Link {
                             request_receipt,
                             requesting,
                         },
-                        tlvs: &[],
+                        tlvs: self.tlvs(),
                     },
                     stamp: true,
                 })
@@ -333,34 +429,66 @@ impl Link {
 
     /// Takes one exchange's four times into the rate and the delay.
     fn measure(&mut self, t1: i128, t2: i128, t3: i128, t4: i128) {
-        if let Some((anchor_t3, anchor_t4)) = self.anchor {
+        let measured = self.anchor.map(|(anchor_t3, anchor_t4)| {
             let local = (t4 - anchor_t4) as f64;
             let neighbor = (t3 - anchor_t3) as f64;
-            let ratio = if local > 0.0 { neighbor / local } else { 0.0 };
-            if (ratio - 1.0).abs() <= self.config.plausible_rate {
-                self.rate = Some(ratio);
-                self.rate_outliers = 0;
-            } else {
-                self.rate_outliers = self.rate_outliers.saturating_add(1);
-                if self.rate_outliers > self.config.allowed_rate_outliers {
-                    self.rate = None;
-                }
-                // The exchange may span a step on either side: its delay
-                // is no measurement either.
-                self.anchor = Some((t3, t4));
-                return;
+            if local > 0.0 { neighbor / local } else { 0.0 }
+        });
+        if measured.is_some_and(|ratio| (ratio - 1.0).abs() > self.config.plausible_rate) {
+            self.rate_outliers = self.rate_outliers.saturating_add(1);
+            if self.rate_outliers > self.config.allowed_rate_outliers {
+                self.rate = None;
             }
+            // The exchange may span a step on either side: its delay
+            // is no measurement either.
+            self.anchor = Some((t3, t4));
+            return;
         }
-        self.anchor = Some((t3, t4));
-        let Some(rate) = self.rate else {
+        let Some(rate) = measured.or(self.rate) else {
+            self.anchor = Some((t3, t4));
             return;
         };
         // 802.1AS-2020 11.2.19.3.4: the round trip in the neighbor's time
         // less its turnaround, halved, in this system's time base.
         let delay = (((t4 - t1) as f64) * rate - (t3 - t2) as f64) / 2.0 / rate;
-        if delay.is_finite() && delay > -self.config.neighbor_prop_delay_thresh * 10.0 {
-            self.delays.push(delay);
+        if !delay.is_finite() || delay <= -self.config.neighbor_prop_delay_thresh * 10.0 {
+            return;
         }
+        // Once a few are kept, one far from their median comes of a bad
+        // time stamp on either side, not of the link: the exchange is left
+        // out, its rate too, unless enough in a row say the link changed,
+        // and then they are kept in place of the old.
+        if let Some(median) = self.delays.median().filter(|_| self.delays.len() >= 3)
+            && (delay - median).abs() > self.config.delay_outlier
+        {
+            self.outlier = Some((delay, median));
+            self.changed.push(delay);
+            self.delay_outliers = self.delay_outliers.saturating_add(1);
+            if self.delay_outliers <= self.config.allowed_delay_outliers {
+                return;
+            }
+            // The rate since the anchor spans the old measurements and the
+            // new, and is neither's: the next one starts from here.
+            self.delays = self.changed.clone();
+            self.changed.clear();
+            self.delay_outliers = 0;
+            self.anchor = Some((t3, t4));
+            return;
+        }
+        self.delays.push(delay);
+        self.changed.clear();
+        self.delay_outliers = 0;
+        if let Some(ratio) = measured {
+            self.rate = Some(ratio);
+            self.rate_outliers = 0;
+        }
+        self.anchor = Some((t3, t4));
+    }
+
+    /// The last delay measurement left out as an outlier, and the median
+    /// it stood from, once.
+    pub fn take_outlier(&mut self) -> Option<(f64, f64)> {
+        self.outlier.take()
     }
 
     fn forget_neighbor(&mut self) {
@@ -368,6 +496,8 @@ impl Link {
         self.rate = None;
         self.rate_outliers = 0;
         self.delays.clear();
+        self.changed.clear();
+        self.delay_outliers = 0;
         self.neighbor = None;
     }
 
@@ -404,8 +534,8 @@ pub fn correction_nanos(correction: i64) -> i128 {
     i128::from(correction >> 16)
 }
 
-/// The mean of the last few delay measurements, without the highest and
-/// lowest once there are enough to spare them.
+/// The median of the last few delay measurements: a few wild ones, as
+/// from a bad time stamp, do not move it.
 #[derive(Debug, Clone)]
 struct DelayFilter {
     samples: [f64; 16],
@@ -435,18 +565,23 @@ impl DelayFilter {
         self.next = 0;
     }
 
-    fn mean(&self) -> Option<f64> {
-        let samples = &self.samples[..self.count];
-        if samples.is_empty() {
+    fn len(&self) -> usize {
+        self.count
+    }
+
+    fn median(&self) -> Option<f64> {
+        if self.count == 0 {
             return None;
         }
-        let sum: f64 = samples.iter().sum();
-        if samples.len() < 4 {
-            return Some(sum / samples.len() as f64);
-        }
-        let highest = samples.iter().copied().fold(f64::MIN, f64::max);
-        let lowest = samples.iter().copied().fold(f64::MAX, f64::min);
-        Some((sum - highest - lowest) / (samples.len() - 2) as f64)
+        let mut sorted = self.samples;
+        let sorted = &mut sorted[..self.count];
+        sorted.sort_unstable_by(f64::total_cmp);
+        let middle = self.count / 2;
+        Some(if self.count.is_multiple_of(2) {
+            (sorted[middle - 1] + sorted[middle]) / 2.0
+        } else {
+            sorted[middle]
+        })
     }
 }
 

@@ -127,8 +127,28 @@ impl Bench {
     }
 
     fn with_clocks(neighbors: Vec<Neighbor>, clocks: [(i128, f64); 3]) -> Self {
+        Self::built(neighbors, clocks, Config::new(ours()))
+    }
+
+    /// A bench whose relay may be grandmaster, at priority1 248, from TAI
+    /// 5000 s at the LocalClock's start.
+    fn grandmaster_capable(neighbors: Vec<Neighbor>) -> Self {
+        let config = Config {
+            identity: SystemIdentity::grandmaster_capable(ours(), 248, 248),
+            ..Config::new(ours())
+        };
+        let mut bench = Self::built(neighbors, [(0, 1.0); 3], config);
+        bench.relay.set_time_base(TimeBase {
+            local: LOCAL_BASE,
+            time: 5_000 * SECOND,
+            rate: 1.0,
+        });
+        bench
+    }
+
+    fn built(neighbors: Vec<Neighbor>, clocks: [(i128, f64); 3], config: Config) -> Self {
         let mut bench = Self {
-            relay: Relay::new(Config::new(ours()), 3),
+            relay: Relay::new(config, 3),
             neighbors,
             clocks,
             now: Duration::ZERO,
@@ -575,6 +595,7 @@ fn a_grandmaster_that_stops_syncing_loses_the_timereceiver_port_until_its_next_a
     assert!(bench.relay.grandmaster().is_some(), "375 ms not yet past");
     bench.run(Duration::from_millis(6_875));
     assert_eq!(bench.relay.grandmaster(), None);
+    assert!(bench.events().contains(&Event::SyncTimeout { port: 1 }));
     bench.run(Duration::from_secs(7));
     assert!(
         bench.relay.grandmaster().is_some(),
@@ -650,4 +671,264 @@ fn messages_of_another_domain_or_profile_are_ignored() {
     };
     bench.deliver(1, &announce, local(bench.now));
     assert_eq!(bench.relay.grandmaster(), None);
+}
+
+#[test]
+fn the_relay_tells_steps_removed_the_path_and_the_last_sync() {
+    let mut bench = Bench::new(std::vec![grandmaster()]);
+    assert_eq!(bench.relay.steps_removed(), 0);
+    assert_eq!(bench.relay.path_trace(), [ours()]);
+    assert_eq!(bench.relay.last_sync(), None);
+    bench.run(Duration::from_secs(8));
+    let gm = grandmaster();
+    assert_eq!(bench.relay.steps_removed(), 1);
+    assert_eq!(bench.relay.path_trace(), [gm.identity.clock, ours()]);
+    assert_eq!(bench.relay.last_sync(), Some(local(bench.now)));
+}
+
+/// Each Follow_Up's precise origin sent on `port` after `after`, with when
+/// its Sync left, on the LocalClock.
+fn own_follow_ups(bench: &Bench, port: u16, after: Duration) -> Vec<(i128, i128)> {
+    let syncs: Vec<(u16, i128)> = bench
+        .sent_on(port, MessageType::Sync, after)
+        .map(|sent| {
+            (
+                sent.message().header.sequence_id,
+                sent.left.expect("stamped"),
+            )
+        })
+        .collect();
+    bench
+        .sent_on(port, MessageType::FollowUp, after)
+        .filter_map(|sent| {
+            let message = sent.message();
+            let Body::FollowUp { precise_origin } = message.body else {
+                return None;
+            };
+            let left = syncs
+                .iter()
+                .find(|(sequence, _)| *sequence == message.header.sequence_id)?
+                .1;
+            Some((left, precise_origin.nanos()))
+        })
+        .collect()
+}
+
+#[test]
+fn a_grandmaster_capable_system_with_nothing_better_sends_its_own_time() {
+    let mut bench = Bench::grandmaster_capable(std::vec![endpoint(1, 0x10)]);
+    bench.run(Duration::from_secs(6));
+    assert!(bench.relay.is_grandmaster());
+    assert_eq!(
+        bench
+            .relay
+            .grandmaster()
+            .map(|grandmaster| grandmaster.clock),
+        Some(ours())
+    );
+    assert_eq!(bench.relay.steps_removed(), 0);
+    assert_eq!(bench.relay.role(1), Some(Role::TimeTransmitter));
+    let follow_ups = own_follow_ups(&bench, 1, Duration::from_secs(4));
+    assert!(follow_ups.len() >= 14, "{} at 8 a second", follow_ups.len());
+    for (left, origin) in follow_ups {
+        assert_eq!(origin, 5_000 * SECOND + (left - LOCAL_BASE));
+    }
+    let announce = bench
+        .sent_on(1, MessageType::Announce, Duration::from_secs(4))
+        .last()
+        .expect("announce");
+    let message = announce.message();
+    let Body::Announce(announce) = message.body else {
+        panic!("not an announce");
+    };
+    assert_eq!(announce.grandmaster, ours());
+    assert_eq!(announce.priority1, 248);
+    assert_eq!(announce.clock_class, 248);
+    assert_eq!(announce.offset_scaled_log_variance, 0x436a);
+    assert_eq!(announce.current_utc_offset, 37);
+    assert_eq!(announce.time_source, INTERNAL_OSCILLATOR);
+    assert_eq!(message.header.flags.0 & Flags::UTC_OFFSET_VALID, 0);
+}
+
+#[test]
+fn a_better_grandmaster_takes_over_and_its_time_carries_on_when_it_goes() {
+    let mut bench = Bench::grandmaster_capable(std::vec![grandmaster(), endpoint(2, 0x30)]);
+    bench.run(Duration::from_secs(8));
+    let gm = grandmaster();
+    assert!(!bench.relay.is_grandmaster());
+    assert_eq!(
+        bench
+            .relay
+            .grandmaster()
+            .map(|grandmaster| grandmaster.clock),
+        Some(gm.identity.clock)
+    );
+    assert_eq!(bench.relay.role(1), Some(Role::TimeReceiver));
+    let indicator = |bench: &Bench, after| {
+        bench
+            .sent_on(2, MessageType::FollowUp, after)
+            .last()
+            .and_then(|sent| sent.message().follow_up_information())
+            .map(|information| information.gm_time_base_indicator)
+    };
+    let before = indicator(&bench, Duration::from_secs(7)).expect("relayed");
+    // The grandmaster goes quiet; its Sync ages out first.
+    bench.neighbors[0].announces = None;
+    bench.neighbors[0].syncs = false;
+    bench.run(Duration::from_secs(14));
+    assert!(bench.relay.is_grandmaster());
+    assert_eq!(
+        bench
+            .relay
+            .grandmaster()
+            .map(|grandmaster| grandmaster.clock),
+        Some(ours())
+    );
+    // Its followers see the grandmaster's time go on, with no step: the
+    // relay holds the rate it last measured.
+    let follow_ups = own_follow_ups(&bench, 2, Duration::from_secs(12));
+    assert!(!follow_ups.is_empty());
+    for (left, origin) in follow_ups {
+        let theirs = gm.clock(left);
+        assert!((origin - theirs).abs() < 100, "{origin} against {theirs}");
+    }
+    assert_ne!(indicator(&bench, Duration::from_secs(12)), Some(before));
+}
+
+#[test]
+fn priority1_255_stops_a_system_being_grandmaster() {
+    let mut bench = Bench::grandmaster_capable(std::vec![endpoint(1, 0x10)]);
+    bench.run(Duration::from_secs(4));
+    assert!(bench.relay.is_grandmaster());
+    let now = bench.now;
+    bench
+        .relay
+        .set_identity(now, SystemIdentity::not_grandmaster_capable(ours()));
+    bench.run(Duration::from_secs(8));
+    assert!(!bench.relay.is_grandmaster());
+    assert_eq!(bench.relay.grandmaster(), None);
+    assert_eq!(
+        bench
+            .sent_on(1, MessageType::Sync, Duration::from_secs(5))
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn each_port_says_it_runs_gptp_and_hears_its_neighbor_say_so() {
+    let mut bench = Bench::new(std::vec![endpoint(1, 0x10)]);
+    bench.run(Duration::from_secs(3));
+    let said: Vec<_> = bench
+        .sent_on(1, MessageType::Signaling, Duration::ZERO)
+        .filter_map(|sent| {
+            sent.message().tlvs().find_map(|tlv| match tlv {
+                Tlv::GptpCapable(capable) => Some(capable),
+                _ => None,
+            })
+        })
+        .collect();
+    assert!(said.len() >= 3, "once a second, {}", said.len());
+    assert_eq!(said[0].tlv_type, 0x8000);
+    assert!(!bench.relay.neighbor_gptp_capable(bench.now, 1));
+    let neighbor = endpoint(1, 0x10);
+    let mut tlv = [0; 16];
+    let length = Tlv::GptpCapable(GptpCapable {
+        tlv_type: 0x8000,
+        log_interval: 0,
+        flags: 0,
+    })
+    .encode(&mut tlv)
+    .expect("encodes");
+    let signaling = Message {
+        header: neighbor.header(1, 0, 5, 0x7f),
+        body: Body::Signaling {
+            target: PortIdentity {
+                clock: ClockIdentity(u64::MAX),
+                port: u16::MAX,
+            },
+        },
+        tlvs: &tlv[..length],
+    };
+    let now = local(bench.now);
+    bench.deliver(1, &signaling, now);
+    assert!(bench.relay.neighbor_gptp_capable(bench.now, 1));
+    // Nine intervals on with no word, it lapses.
+    let later = bench.now + Duration::from_secs(10);
+    assert!(!bench.relay.neighbor_gptp_capable(later, 1));
+}
+
+#[test]
+fn a_grandmaster_capable_system_listens_before_it_leads() {
+    // With a better grandmaster on the link, it never leads, not even for
+    // the moment before that one's Announce comes.
+    let mut bench = Bench::grandmaster_capable(std::vec![grandmaster()]);
+    bench.run(Duration::from_secs(8));
+    let events = bench.events();
+    assert!(
+        !events.iter().any(
+            |event| matches!(event, Event::Grandmaster(Some(system)) if system.clock == ours())
+        ),
+        "{events:?}"
+    );
+    assert_eq!(
+        bench.sent_on(1, MessageType::Sync, Duration::ZERO).count(),
+        0
+    );
+    assert!(!bench.relay.is_grandmaster());
+}
+
+#[test]
+fn with_nothing_better_heard_it_leads_once_it_has_listened() {
+    let mut bench = Bench::grandmaster_capable(std::vec![endpoint(1, 0x10)]);
+    bench.run(Duration::from_secs(10));
+    let capable = bench
+        .sent
+        .iter()
+        .find(|sent| {
+            sent.message().message_type() == MessageType::PdelayReq
+                && sent.now >= Duration::from_secs(1)
+        })
+        .map(|sent| sent.now)
+        .expect("asking");
+    let first_sync = bench
+        .sent_on(1, MessageType::Sync, Duration::ZERO)
+        .next()
+        .map(|sent| sent.now)
+        .expect("leads in the end");
+    // Three Announce intervals after the port became asCapable, at about
+    // a second.
+    assert!(
+        first_sync >= capable + Duration::from_secs(3),
+        "{first_sync:?}"
+    );
+    assert!(bench.relay.is_grandmaster());
+}
+
+#[test]
+fn a_lone_port_going_down_is_no_takeover() {
+    let mut bench = Bench::grandmaster_capable(std::vec![grandmaster()]);
+    bench.run(Duration::from_secs(8));
+    assert!(bench.relay.grandmaster().is_some());
+    assert!(!bench.relay.is_grandmaster());
+    let now = bench.now;
+    bench.relay.set_port(now, 1, false);
+    assert!(!bench.relay.is_grandmaster());
+    assert_eq!(bench.relay.grandmaster(), None);
+    // Back up, it listens first, and follows the grandmaster again.
+    bench.relay.set_port(now, 1, true);
+    bench.run(Duration::from_secs(14));
+    assert!(!bench.relay.is_grandmaster());
+    assert_eq!(
+        bench
+            .relay
+            .grandmaster()
+            .map(|grandmaster| grandmaster.clock),
+        Some(grandmaster().identity.clock)
+    );
+    assert!(
+        !bench.events().iter().any(
+            |event| matches!(event, Event::Grandmaster(Some(system)) if system.clock == ours())
+        )
+    );
 }

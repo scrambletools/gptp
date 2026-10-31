@@ -58,6 +58,27 @@ fn identities_show_as_linuxptp_shows_them() {
 }
 
 #[test]
+fn identities_parse_as_linuxptp_shows_them() {
+    let clock = ClockIdentity(0x8c1f_64ff_fe36_c130);
+    assert_eq!("8c1f64.fffe.36c130".parse(), Ok(clock));
+    assert_eq!(
+        "8c1f64.fffe.36c130-4".parse(),
+        Ok(PortIdentity { clock, port: 4 })
+    );
+    for wrong in [
+        "",
+        "8c1f64.fffe",
+        "8c1f64fffe36c130",
+        "8c1f64.fffe.36c13g",
+        "8c1f64.fffe.36c130.0",
+    ] {
+        assert!(wrong.parse::<ClockIdentity>().is_err(), "{wrong}");
+    }
+    assert!("8c1f64.fffe.36c130".parse::<PortIdentity>().is_err());
+    assert!("8c1f64.fffe.36c130-x".parse::<PortIdentity>().is_err());
+}
+
+#[test]
 fn recorded_messages_encode_as_they_were_received() {
     for (name, hex) in RECORDED {
         let received = octets(hex);
@@ -270,11 +291,12 @@ fn what_is_not_a_gptp_message_says_why() {
         Message::decode(&version_one),
         Err(DecodeError::UnsupportedVersion(1))
     );
-    let mut delay_request = sync.clone();
-    delay_request[0] = 0x11;
+    // Management, which neither gPTP nor AVB Lite uses.
+    let mut management = sync.clone();
+    management[0] = 0x1d;
     assert_eq!(
-        Message::decode(&delay_request),
-        Err(DecodeError::WrongMessageType(1))
+        Message::decode(&management),
+        Err(DecodeError::WrongMessageType(0xd))
     );
     let mut no_room = sync.clone();
     no_room[3] = 40;
@@ -309,4 +331,91 @@ fn no_cut_or_corrupted_message_panics() {
             }
         }
     }
+}
+
+#[test]
+fn end_to_end_delay_messages_encode_as_they_decode() {
+    let source = PortIdentity {
+        clock: ClockIdentity(0x8c1f_64ff_fe36_c130),
+        port: 1,
+    };
+    let header = Header {
+        major_sdo_id: 0,
+        minor_version: 0,
+        version: 2,
+        domain: 0,
+        minor_sdo_id: 0,
+        flags: Flags(0),
+        correction: 0,
+        type_specific: 0,
+        source,
+        sequence_id: 9,
+        control: 1,
+        log_interval: 0x7f,
+    };
+    let request = Message {
+        header,
+        body: Body::DelayReq {
+            origin: Timestamp::default(),
+        },
+        tlvs: &[],
+    };
+    let response = Message {
+        header: Header {
+            control: 3,
+            log_interval: 0,
+            ..header
+        },
+        body: Body::DelayResp {
+            receive: Timestamp {
+                seconds: 1_793_430_000,
+                nanoseconds: 125,
+            },
+            requesting: source,
+        },
+        tlvs: &[],
+    };
+    for (message, length, kind) in [
+        (request, 44, MessageType::DelayReq),
+        (response, 54, MessageType::DelayResp),
+    ] {
+        let mut octets = [0; 64];
+        let written = message.encode(&mut octets).expect("encodes");
+        assert_eq!(written, length);
+        assert_eq!(octets[0], kind as u8);
+        let decoded = Message::decode(&octets[..written]).expect("decodes");
+        assert_eq!(decoded, message);
+        assert_eq!(kind.event(), kind == MessageType::DelayReq);
+    }
+}
+
+#[test]
+fn the_gptp_capable_tlv_reads_as_a_talker_sends_it() {
+    // A talker's Signaling, as captured on a bridge port.
+    let frame = octets(
+        "1c02003c000000000000000000000000000000008c1f64fffe36c13000015ad3007f\
+         ffffffffffffffffffff8000000c0080c2000004000000000000",
+    );
+    let message = Message::decode(&frame).expect("decodes");
+    assert_eq!(message.message_type(), MessageType::Signaling);
+    let capable = message
+        .tlvs()
+        .find_map(|tlv| match tlv {
+            Tlv::GptpCapable(capable) => Some(capable),
+            _ => None,
+        })
+        .expect("gPTP capable");
+    assert_eq!(
+        capable,
+        GptpCapable {
+            tlv_type: 0x8000,
+            log_interval: 0,
+            flags: 0
+        }
+    );
+    let mut encoded = [0; 16];
+    let length = Tlv::GptpCapable(capable)
+        .encode(&mut encoded)
+        .expect("encodes");
+    assert_eq!(&encoded[..length], &frame[44..]);
 }

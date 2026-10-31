@@ -18,6 +18,8 @@ pub const HEADER_LENGTH: usize = 34;
 
 /// tlvType of an organization extension, as 802.1AS's own TLVs are.
 pub const ORGANIZATION_EXTENSION: u16 = 0x0003;
+/// tlvType of an organization extension a receiver does not pass on.
+pub const ORGANIZATION_EXTENSION_DO_NOT_PROPAGATE: u16 = 0x8000;
 /// tlvType of the path trace TLV.
 pub const PATH_TRACE: u16 = 0x0008;
 /// IEEE 802.1's organization identifier, 00-80-C2.
@@ -40,6 +42,38 @@ impl fmt::Display for ClockIdentity {
     }
 }
 
+/// Text that is not an identity as linuxptp shows one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseIdentityError;
+
+impl fmt::Display for ParseIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("not an identity like 000a92.fffe.026e05 or 000a92.fffe.026e05-1")
+    }
+}
+
+impl core::str::FromStr for ClockIdentity {
+    type Err = ParseIdentityError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let mut parts = text.split('.');
+        let lengths = [6, 4, 6];
+        let mut value = 0u64;
+        for length in lengths {
+            let part = parts.next().ok_or(ParseIdentityError)?;
+            if part.len() != length || !part.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(ParseIdentityError);
+            }
+            let digits = u64::from_str_radix(part, 16).map_err(|_| ParseIdentityError)?;
+            value = value << (length * 4) | digits;
+        }
+        if parts.next().is_some() {
+            return Err(ParseIdentityError);
+        }
+        Ok(Self(value))
+    }
+}
+
 /// A clock's port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct PortIdentity {
@@ -51,6 +85,18 @@ pub struct PortIdentity {
 impl fmt::Display for PortIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}-{}", self.clock, self.port)
+    }
+}
+
+impl core::str::FromStr for PortIdentity {
+    type Err = ParseIdentityError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let (clock, port) = text.rsplit_once('-').ok_or(ParseIdentityError)?;
+        Ok(Self {
+            clock: clock.parse()?,
+            port: port.parse().map_err(|_| ParseIdentityError)?,
+        })
     }
 }
 
@@ -82,9 +128,13 @@ impl Timestamp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MessageType {
     Sync = 0x0,
+    /// IEEE 1588's end-to-end delay request, as the AVB Lite PTP profile
+    /// measures with.
+    DelayReq = 0x1,
     PdelayReq = 0x2,
     PdelayResp = 0x3,
     FollowUp = 0x8,
+    DelayResp = 0x9,
     PdelayRespFollowUp = 0xa,
     Announce = 0xb,
     Signaling = 0xc,
@@ -94,9 +144,11 @@ impl MessageType {
     fn of(nibble: u8) -> Option<Self> {
         Some(match nibble {
             0x0 => Self::Sync,
+            0x1 => Self::DelayReq,
             0x2 => Self::PdelayReq,
             0x3 => Self::PdelayResp,
             0x8 => Self::FollowUp,
+            0x9 => Self::DelayResp,
             0xa => Self::PdelayRespFollowUp,
             0xb => Self::Announce,
             0xc => Self::Signaling,
@@ -106,7 +158,10 @@ impl MessageType {
 
     /// Whether its transmission and reception are time stamped.
     pub fn event(self) -> bool {
-        matches!(self, Self::Sync | Self::PdelayReq | Self::PdelayResp)
+        matches!(
+            self,
+            Self::Sync | Self::DelayReq | Self::PdelayReq | Self::PdelayResp
+        )
     }
 }
 
@@ -119,6 +174,8 @@ impl Flags {
     pub const TWO_STEP: u16 = 0x0200;
     /// The grandmaster's time is on the PTP timescale.
     pub const PTP_TIMESCALE: u16 = 0x0008;
+    /// The Announce's currentUtcOffset is known to be right.
+    pub const UTC_OFFSET_VALID: u16 = 0x0004;
 
     pub fn two_step(self) -> bool {
         self.0 & Self::TWO_STEP != 0
@@ -171,6 +228,13 @@ pub enum Body {
     FollowUp {
         precise_origin: Timestamp,
     },
+    DelayReq {
+        origin: Timestamp,
+    },
+    DelayResp {
+        receive: Timestamp,
+        requesting: PortIdentity,
+    },
     /// Ten octets of origin and ten reserved, kept as sent.
     PdelayReq {
         reserved: [u8; 20],
@@ -194,6 +258,8 @@ impl Body {
         match self {
             Self::Sync { .. } => MessageType::Sync,
             Self::FollowUp { .. } => MessageType::FollowUp,
+            Self::DelayReq { .. } => MessageType::DelayReq,
+            Self::DelayResp { .. } => MessageType::DelayResp,
             Self::PdelayReq { .. } => MessageType::PdelayReq,
             Self::PdelayResp { .. } => MessageType::PdelayResp,
             Self::PdelayRespFollowUp { .. } => MessageType::PdelayRespFollowUp,
@@ -205,10 +271,14 @@ impl Body {
     /// The octets the body takes after the header.
     pub fn encoded_len(&self) -> usize {
         match self {
-            Self::Sync { .. } | Self::FollowUp { .. } | Self::Signaling { .. } => 10,
-            Self::PdelayReq { .. } | Self::PdelayResp { .. } | Self::PdelayRespFollowUp { .. } => {
-                20
-            }
+            Self::Sync { .. }
+            | Self::FollowUp { .. }
+            | Self::DelayReq { .. }
+            | Self::Signaling { .. } => 10,
+            Self::DelayResp { .. }
+            | Self::PdelayReq { .. }
+            | Self::PdelayResp { .. }
+            | Self::PdelayRespFollowUp { .. } => 20,
             Self::Announce(_) => 30,
         }
     }
@@ -236,6 +306,15 @@ pub struct IntervalRequest {
     pub announce: i8,
     pub flags: u8,
     pub reserved: [u8; 2],
+}
+
+/// The gPTP-capable TLV (802.1AS-2020 10.6.4.4): a Signaling message's
+/// word that its sender runs gPTP on the link, and how often it says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GptpCapable {
+    pub tlv_type: u16,
+    pub log_interval: i8,
+    pub flags: u8,
 }
 
 /// A path trace TLV's clocks, the grandmaster's first, as a view over
@@ -267,6 +346,7 @@ pub enum Tlv<'a> {
     FollowUpInformation(FollowUpInformation),
     PathTrace(PathTrace<'a>),
     IntervalRequest(IntervalRequest),
+    GptpCapable(GptpCapable),
     /// Any other TLV, as received.
     Other {
         tlv_type: u16,
@@ -289,7 +369,7 @@ impl<'a> Tlv<'a> {
         4 + match self {
             Self::FollowUpInformation(_) => 28,
             Self::PathTrace(path) => path.0.len(),
-            Self::IntervalRequest(_) => 12,
+            Self::IntervalRequest(_) | Self::GptpCapable(_) => 12,
             Self::Other { value, .. } => value.len(),
         }
     }
@@ -320,6 +400,11 @@ impl<'a> Tlv<'a> {
                     request.flags,
                 ]);
                 writer.put(&request.reserved);
+            }
+            Self::GptpCapable(capable) => {
+                writer.organization(capable.tlv_type, 12, 4);
+                writer.put(&[capable.log_interval as u8, capable.flags]);
+                writer.put(&[0; 4]);
             }
             Self::Other { tlv_type, value } => {
                 writer.put(&tlv_type.to_be_bytes());
@@ -362,6 +447,11 @@ impl<'a> Tlv<'a> {
                 announce: value[8] as i8,
                 flags: value[9],
                 reserved: [value[10], value[11]],
+            })),
+            (_, 4, 12) => Some(Self::GptpCapable(GptpCapable {
+                tlv_type,
+                log_interval: value[6] as i8,
+                flags: value[7],
             })),
             _ => None,
         }
@@ -518,6 +608,13 @@ impl<'a> Message<'a> {
             MessageType::FollowUp => Body::FollowUp {
                 precise_origin: read_timestamp(octets, at),
             },
+            MessageType::DelayReq => Body::DelayReq {
+                origin: read_timestamp(octets, at),
+            },
+            MessageType::DelayResp => Body::DelayResp {
+                receive: read_timestamp(octets, at),
+                requesting: read_port_identity(octets, at + 10),
+            },
             MessageType::PdelayReq => Body::PdelayReq {
                 reserved: octets[at..at + 20].try_into().expect("20 octets"),
             },
@@ -581,8 +678,13 @@ impl<'a> Message<'a> {
         match &self.body {
             Body::Sync { origin } => writer.timestamp(*origin),
             Body::FollowUp { precise_origin } => writer.timestamp(*precise_origin),
+            Body::DelayReq { origin } => writer.timestamp(*origin),
             Body::PdelayReq { reserved } => writer.put(reserved),
-            Body::PdelayResp {
+            Body::DelayResp {
+                receive: time,
+                requesting,
+            }
+            | Body::PdelayResp {
                 request_receipt: time,
                 requesting,
             }
@@ -638,8 +740,14 @@ impl<'a> Message<'a> {
 
 fn body_length(message_type: MessageType) -> usize {
     match message_type {
-        MessageType::Sync | MessageType::FollowUp | MessageType::Signaling => 10,
-        MessageType::PdelayReq | MessageType::PdelayResp | MessageType::PdelayRespFollowUp => 20,
+        MessageType::Sync
+        | MessageType::FollowUp
+        | MessageType::DelayReq
+        | MessageType::Signaling => 10,
+        MessageType::DelayResp
+        | MessageType::PdelayReq
+        | MessageType::PdelayResp
+        | MessageType::PdelayRespFollowUp => 20,
         MessageType::Announce => 30,
     }
 }

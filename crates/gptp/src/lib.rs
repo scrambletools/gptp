@@ -15,15 +15,20 @@
 #![no_std]
 
 extern crate alloc;
-#[cfg(test)]
+#[cfg(any(feature = "std", test))]
 extern crate std;
 
+pub mod e2e;
 pub mod link;
+pub mod lite;
 pub mod message;
 pub mod relay;
+pub mod status;
+pub mod time;
 
 pub use message::{
-    ClockIdentity, DecodeError, EncodeError, Message, MessageType, PortIdentity, Timestamp, Tlv,
+    ClockIdentity, DecodeError, EncodeError, GptpCapable, Message, MessageType, ParseIdentityError,
+    PortIdentity, Timestamp, Tlv,
 };
 
 /// Ethertype of gPTP.

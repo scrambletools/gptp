@@ -1,6 +1,6 @@
 [package]
 name = "gptp"
-description = "IEEE 802.1AS gPTP: messages, and a time-aware relay's state machines, without I/O"
+description = "IEEE 802.1AS gPTP without I/O: messages, link, relay and end station, grandmaster, the AVB Lite PTP profile, and the time mapping and status gptpd gives applications"
 version = "0.1.0"
 categories = ["network-programming", "no-std"]
 keywords = ["avb", "tsn", "gptp", "ptp", "802-1as"]
@@ -9,6 +9,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
+
+[features]
+default = ["std"]
+# The reader of gptpd's time file and the status client. Without it the
+# crate needs neither std nor I/O.
+std = []
 
 [lints]
 workspace = true
