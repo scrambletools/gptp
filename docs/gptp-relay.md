@@ -101,8 +101,8 @@ LocalClock's card was reset.
 The comparison's error adds to every residence time. The target is under
 100 ns: `avb-residence` measured the same comparison at a standard
 deviation under 50 ns, and the grandmaster time `avb-gptpd` worked out
-from each Sync, on one port against ptp4l's, stood -6 ns from ptp4l's
-with a standard deviation of 59 ns. Anything
+from each Sync, on one port against ptp4l's and through the comparison,
+stood -5 ns from ptp4l's with a standard deviation of 50 ns. Anything
 that later needs the grandmaster's time on a PHC, such as launch times
 for a credit-based shaper, converts from the LocalClock with the relay's
 offset and rate, rather than moving a clock.

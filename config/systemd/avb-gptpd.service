@@ -3,8 +3,11 @@ Description=AVB bridge: gPTP (802.1AS) time-aware relay on the switch ports
 After=network-online.target
 Wants=network-online.target
 # One gPTP daemon at a time: starting this one stops linuxptp's, and
-# starting gptp-bridge stops this one.
+# starting gptp-bridge stops this one. Ordered too, so the stop is done
+# before the start either way: two responders to one Pdelay_Req, even
+# once, make a strict neighbor fall back to plain PTP.
 Conflicts=gptp-bridge.service gptp-phc2sys.service
+After=gptp-bridge.service gptp-phc2sys.service
 # However often it fails, start it again: an unattended bridge without
 # gPTP stops every stream through it.
 StartLimitIntervalSec=0
