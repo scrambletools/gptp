@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      # gptpd runs on Linux only; gptp and raw-ether everywhere.
+      - name: Clippy
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then scope=(--workspace); else scope=(--workspace --exclude gptpd); fi
+          cargo clippy "${scope[@]}" --all-targets --locked -- -D warnings
+      - name: Test
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then scope=(--workspace); else scope=(--workspace --exclude gptpd); fi
+          cargo test "${scope[@]}" --locked
+
+  # The protocol crate builds without std, for apps with other
+  # constraints, down to microcontrollers such as the ESP32-C6
+  # (riscv32imac).
+  protocol-crate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv32imac-unknown-none-elf
+      - uses: Swatinem/rust-cache@v2
+      - name: Build without std
+        run: cargo build -p gptp --no-default-features --target riscv32imac-unknown-none-elf
+      - name: Test on its own
+        run: cargo test -p gptp
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

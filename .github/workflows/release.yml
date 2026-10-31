@@ -1,0 +1,217 @@
+name: Release
+
+# A tag such as v0.1.0 builds gptpd's packages, tests each in fresh
+# containers, and drafts a GitHub release with them. Running the workflow
+# by hand builds and tests the same packages without a release.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  NFPM_VERSION: 2.43.0
+
+jobs:
+  linux:
+    # Built on Ubuntu 24.04, the oldest system the packages are for, so
+    # they run on the newer ones too. GitHub has no RISC-V runners, so
+    # that build is cross-compiled and run under QEMU.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            deb: amd64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            deb: arm64
+          - arch: riscv64
+            runner: ubuntu-24.04
+            deb: riscv64
+            target: riscv64gc-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the cross toolchain
+        if: ${{ matrix.target }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-riscv64-linux-gnu libc6-dev-riscv64-cross qemu-user-static
+          echo "CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc" >>"$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+      - name: Version
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/gptpd/Cargo.toml | head -1)
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "v$version" != "${GITHUB_REF_NAME}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match gptpd's version $version" >&2
+            exit 1
+          fi
+          pkgver=$(sed -n 's/^pkgver=//p' packaging/arch/gptpd/PKGBUILD)
+          if [ "$pkgver" != "$version" ]; then
+            echo "The PKGBUILD's pkgver $pkgver is not gptpd's version $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+      - name: Build
+        id: build
+        run: |
+          if [ -n "$TARGET" ]; then
+            cargo build --release --locked -p gptpd --target "$TARGET"
+            echo "binaries=target/$TARGET/release" >>"$GITHUB_OUTPUT"
+          else
+            cargo build --release --locked -p gptpd
+            echo "binaries=target/release" >>"$GITHUB_OUTPUT"
+          fi
+        env:
+          TARGET: ${{ matrix.target }}
+      # The packages ask for the glibc nfpm.yaml names; the binary must
+      # need no newer.
+      - name: Check that it runs, and the glibc it needs
+        run: |
+          binary=${{ steps.build.outputs.binaries }}/gptpd
+          run="" objdump=objdump
+          if [ -n "$TARGET" ]; then
+            run="qemu-riscv64-static -L /usr/riscv64-linux-gnu"
+            objdump=riscv64-linux-gnu-objdump
+          fi
+          $run "$binary" --version
+          needed=$($objdump -T "$binary" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)
+          declared=$(sed -n 's/.*libc6 (>= \([0-9.]*\)).*/\1/p' packaging/nfpm.yaml)
+          echo "needs glibc $needed, the packages ask for $declared"
+          if [ "$(printf '%s\n' "$needed" "$declared" | sort -V | tail -1)" != "$declared" ]; then
+            echo "gptpd needs glibc $needed, newer than the $declared the packages ask for" >&2
+            exit 1
+          fi
+        env:
+          TARGET: ${{ matrix.target }}
+      - name: Stage
+        run: scripts/dist-install.sh ${{ steps.build.outputs.binaries }} stage /usr
+      - name: Debian and RPM packages
+        run: |
+          curl -sSLf -o nfpm.deb \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_$(dpkg --print-architecture).deb"
+          sudo dpkg -i nfpm.deb
+          mkdir -p dist
+          export VERSION=${{ steps.version.outputs.version }}
+          ARCH=${{ matrix.deb }} nfpm package -f packaging/nfpm.yaml -p deb -t dist/
+          ARCH=${{ matrix.arch }} nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+
+  linux-install:
+    # Fresh containers of the distributions the packages are for; RISC-V
+    # under QEMU.
+    name: linux-install (${{ matrix.image }}, ${{ matrix.arch }})
+    needs: linux
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        image: ['debian:13', 'ubuntu:24.04', 'ubuntu:26.04', 'fedora:44']
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: riscv64
+            image: 'debian:13'
+            runner: ubuntu-24.04
+          - arch: riscv64
+            image: 'ubuntu:24.04'
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: packages
+      - if: matrix.arch == 'riscv64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
+      - name: Install, run and remove
+        run: |
+          case $IMAGE in
+          fedora:*) package=$(ls packages/*.rpm) ;;
+          *) package=$(ls packages/*.deb) ;;
+          esac
+          packaging/tests/run.sh "$IMAGE" "$package"
+        env:
+          IMAGE: ${{ matrix.image }}
+
+  arch-install:
+    # The PKGBUILD, built from this tree in a fresh Arch container as
+    # someone building it would, and its package tested like the others.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the package
+        run: |
+          pkgver=$(sed -n 's/^pkgver=//p' packaging/arch/gptpd/PKGBUILD)
+          git archive --prefix="gptp-$pkgver/" -o "gptp-$pkgver.tar.gz" HEAD
+          docker run --rm -v "$PWD:/work" -w /work archlinux:latest \
+            packaging/tests/build-arch.sh "gptp-$pkgver.tar.gz" dist-arch
+      - name: Install, run and remove
+        run: packaging/tests/run.sh archlinux:latest dist-arch/gptpd-[0-9]*.pkg.tar.zst
+
+  pkgbuild:
+    # The release's PKGBUILD builds from GitHub's source archive of the
+    # tag; its checksum is only known once the tag exists.
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: PKGBUILD with the source checksum
+        run: |
+          curl -sSLf -o source.tar.gz \
+            "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          sum=$(sha256sum source.tar.gz | cut -d' ' -f1)
+          mkdir -p pkgbuild
+          sed "s/^sha256sums=('SKIP')/sha256sums=('$sum')/" packaging/arch/gptpd/PKGBUILD >pkgbuild/PKGBUILD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkgbuild
+          path: pkgbuild/*
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [linux, linux-install, arch-install, pkgbuild]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect files and notes
+        run: |
+          mkdir -p upload
+          cp artifacts/linux-*/* artifacts/pkgbuild/* upload/
+          (cd upload && sha256sum * >SHA256SUMS)
+          version=${GITHUB_REF_NAME#v}
+          # This version's section of the changelog, without its heading.
+          touch notes.md
+          if [ -f CHANGELOG.md ]; then
+            awk -v version="$version" '
+              /^## / { found = index($0, "[" version "]") > 0; next }
+              found' CHANGELOG.md >notes.md
+          fi
+      - name: Draft the release
+        run: |
+          if [ -s notes.md ]; then notes=(--notes-file notes.md); else notes=(--generate-notes); fi
+          gh release create "$GITHUB_REF_NAME" upload/* \
+            --draft --title "gptpd ${GITHUB_REF_NAME#v}" "${notes[@]}"
+        env:
+          GH_TOKEN: ${{ github.token }}
