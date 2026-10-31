@@ -1,5 +1,5 @@
 [package]
-name = "avb-gptp"
+name = "gptp"
 description = "IEEE 802.1AS gPTP: messages, and a time-aware relay's state machines, without I/O"
 version = "0.1.0"
 categories = ["network-programming", "no-std"]
