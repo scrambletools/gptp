@@ -65,8 +65,18 @@ impl HardwareClock {
     /// tightest of several pairs kept, so the system clock drops out.
     /// Linux only; elsewhere unsupported.
     pub fn offset_from(&self, other: &HardwareClock) -> io::Result<i128> {
-        Ok(self.inner.offset_from_system(SystemClock::Realtime)?
-            - other.inner.offset_from_system(SystemClock::Realtime)?)
+        self.reading_from(other).map(|reading| reading.offset)
+    }
+
+    /// [`offset_from`](Self::offset_from) with its span: the two clocks'
+    /// spans together.
+    pub fn reading_from(&self, other: &HardwareClock) -> io::Result<Reading> {
+        let ours = self.inner.reading_from_system(SystemClock::Realtime)?;
+        let theirs = other.inner.reading_from_system(SystemClock::Realtime)?;
+        Ok(Reading {
+            offset: ours.offset - theirs.offset,
+            span: ours.span.saturating_add(theirs.span),
+        })
     }
 
     /// How far this clock is ahead of `system`, in nanoseconds, from its
@@ -75,7 +85,14 @@ impl HardwareClock {
     /// than the wall clock for it refuses the others, and then
     /// [`offset_read_against`](Self::offset_read_against) serves.
     pub fn offset_from_system_clock(&self, system: SystemClock) -> io::Result<i128> {
-        self.inner.offset_from_system(system)
+        self.reading_from_system_clock(system)
+            .map(|reading| reading.offset)
+    }
+
+    /// [`offset_from_system_clock`](Self::offset_from_system_clock) with
+    /// the span of the reading kept.
+    pub fn reading_from_system_clock(&self, system: SystemClock) -> io::Result<Reading> {
+        self.inner.reading_from_system(system)
     }
 
     /// How far the clock is ahead of this computer's monotonic clock, in
@@ -91,24 +108,48 @@ impl HardwareClock {
     /// [`offset_from_monotonic`](Self::offset_from_monotonic) reads it:
     /// looser than the driver's readings, but on every kernel.
     pub fn offset_read_against(&self, system: SystemClock) -> io::Result<i128> {
-        let mut tries = [(0u128, 0i128); 5];
+        self.reading_against(system).map(|reading| reading.offset)
+    }
+
+    /// [`offset_read_against`](Self::offset_read_against) with the span of
+    /// the try kept. Where none stands near the median, the median's.
+    pub fn reading_against(&self, system: SystemClock) -> io::Result<Reading> {
+        let mut tries = [Reading { offset: 0, span: 0 }; 5];
         for slot in &mut tries {
             let before = system_now(system);
             let clock = self.now()?;
             let after = system_now(system);
             let span = after.saturating_sub(before).as_nanos();
             let middle = before + (after - before) / 2;
-            *slot = (span, clock.as_nanos() as i128 - middle.as_nanos() as i128);
+            *slot = Reading {
+                offset: clock.as_nanos() as i128 - middle.as_nanos() as i128,
+                span: u64::try_from(span).unwrap_or(u64::MAX),
+            };
         }
-        let mut offsets = tries.map(|(_, offset)| offset);
-        offsets.sort_unstable();
-        let median = offsets[offsets.len() / 2];
+        let mut sorted = tries;
+        sorted.sort_unstable_by_key(|reading| reading.offset);
+        let median = sorted[sorted.len() / 2];
         Ok(tries
-            .iter()
-            .filter(|(_, offset)| (offset - median).abs() <= 10_000)
-            .min_by_key(|(span, _)| *span)
-            .map_or(median, |(_, offset)| *offset))
+            .into_iter()
+            .filter(|reading| (reading.offset - median.offset).abs() <= 10_000)
+            .min_by_key(|reading| reading.span)
+            .unwrap_or(median))
     }
+}
+
+/// A hardware clock against another clock, read between two of the
+/// other's readings: how far it was ahead, and how long the reading took
+/// from the other's first to its second. The hardware clock is latched
+/// somewhere in that span, so a reading is off by up to half of it; a
+/// slow one, held up on the way to the latch or after it, by up to half
+/// of what it took beyond the usual. Comparisons that must hold to less
+/// than a microsecond can leave such readings out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reading {
+    /// The hardware clock less the other, in nanoseconds.
+    pub offset: i128,
+    /// How long the reading took, in nanoseconds.
+    pub span: u64,
 }
 
 /// How far back comparisons count towards the rate, in nanoseconds: long
@@ -235,7 +276,7 @@ pub fn precise_sleeps() {
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 mod platform {
-    use super::SystemClock;
+    use super::{Reading, SystemClock};
     use std::io;
     use std::mem::size_of;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -312,10 +353,10 @@ mod platform {
             .map(|_| ())
         }
 
-        /// The clock less the system clock, in nanoseconds, from its
-        /// driver's tightest of several readings between two of the system
-        /// clock (PTP_SYS_OFFSET_EXTENDED).
-        pub fn offset_from_system(&self, system: SystemClock) -> io::Result<i128> {
+        /// The clock less the system clock, from its driver's tightest of
+        /// several readings between two of the system clock
+        /// (PTP_SYS_OFFSET_EXTENDED).
+        pub fn reading_from_system(&self, system: SystemClock) -> io::Result<Reading> {
             /// struct ptp_clock_time, from linux/ptp_clock.h.
             #[repr(C)]
             #[derive(Clone, Copy, Default)]
@@ -361,10 +402,12 @@ mod platform {
                 .iter()
                 .map(|[before, clock, after]| {
                     let (before, after) = (nanos(*before), nanos(*after));
-                    (after - before, nanos(*clock) - (before + after) / 2)
+                    Reading {
+                        offset: nanos(*clock) - (before + after) / 2,
+                        span: u64::try_from(after - before).unwrap_or(u64::MAX),
+                    }
                 })
-                .min_by_key(|(span, _)| *span)
-                .map(|(_, offset)| offset)
+                .min_by_key(|reading| reading.span)
                 .ok_or_else(|| io::Error::other("the clock gave no samples"))
         }
     }
@@ -424,7 +467,10 @@ mod platform {
             Err(unsupported())
         }
 
-        pub fn offset_from_system(&self, _system: super::SystemClock) -> io::Result<i128> {
+        pub fn reading_from_system(
+            &self,
+            _system: super::SystemClock,
+        ) -> io::Result<super::Reading> {
             Err(unsupported())
         }
     }

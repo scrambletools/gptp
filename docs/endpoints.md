@@ -82,6 +82,10 @@ with SO_PEERCRED. gptpd uses no D-Bus.
   PTP_SYS_OFFSET_EXTENDED, and CLOCK_MONOTONIC with RAW, since
   applications sleep on MONOTONIC. NTP's steps and frequency changes,
   which move CLOCK_REALTIME, never read as jumps of the hardware clock.
+  A reading that takes more than 400 ns longer than the narrowest of the
+  last 64 is left out, for an end station's clock and the bridge's
+  alike: held up on the way to the clock, it stands up to a microsecond
+  off.
 - A jump of the hardware clock is published as a new generation. igb
   resets an I210's clock on a link bounce, and igc moves an i226's by a
   few µs on link changes. After a jump the port stays down until the

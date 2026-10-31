@@ -595,6 +595,7 @@ impl Daemon {
         let Some(end) = &mut self.end_station else {
             return;
         };
+        let slow = end.station.slow();
         match end.station.compare(self.clocks.local_clock()) {
             Ok(Found::Steady) => {}
             Ok(Found::Jumped(moved)) => {
@@ -632,6 +633,14 @@ impl Daemon {
         let Some(end) = &mut self.end_station else {
             return;
         };
+        let now_slow = end.station.slow();
+        if (slow + 1..=now_slow).any(|count| count <= 10 || telling(count)) {
+            eprintln!(
+                "{}: a slow reading of its clock left out, {} ns ({now_slow} so far)",
+                self.ports[0].name,
+                end.station.slow_span()
+            );
+        }
         if end.station.awaiting_rebase()
             && let Ok(local) = self.clocks.now()
             && let Some((local, time, rate)) = end.station.rebased(local)

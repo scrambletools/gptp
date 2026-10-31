@@ -5,6 +5,7 @@
 //! servo would have: offset and rate, and a new generation at each
 //! discontinuity.
 
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
@@ -13,7 +14,7 @@ use std::time::Duration;
 
 use gptp::ClockIdentity;
 use gptp::time::{Mapping, State};
-use raw_ether::clock::{Comparison, HardwareClock, SystemClock};
+use raw_ether::clock::{Comparison, HardwareClock, Reading, SystemClock};
 
 /// How far a comparison against the raw clock may stand from what the
 /// last ones foretold before the hardware clock is taken to have jumped,
@@ -27,6 +28,21 @@ const JUMP_READ: i128 = 10_000;
 /// from them. Read by the driver, a reading is good to tens of ns.
 const KINK_TIGHT: i128 = 500;
 const KINK_READ: i128 = 20_000;
+
+/// How much longer than the narrowest recent reading, in nanoseconds, a
+/// reading may take and still count, with the driver's readings and with
+/// reads between the system clock's: off by at most half that, it stays
+/// well inside the bounds above. A reading held up, as when the bus is
+/// busy, takes microseconds longer and stands up to half of that off,
+/// one way.
+pub const SLOW_TIGHT: u64 = 400;
+const SLOW_READ: u64 = 4_000;
+
+/// How many recent readings the narrowest is taken from: at one
+/// comparison every 100 ms, the last 6.4 s, longer than a slow stretch
+/// lasts, short enough to take up a lasting change in what a reading
+/// costs.
+const SPANS_KEPT: usize = 64;
 
 /// How old an earlier gptpd's record may be for a restart to go on from
 /// its time.
@@ -45,6 +61,11 @@ pub struct Station {
     /// Against CLOCK_MONOTONIC_RAW, which nothing adjusts, to tell when
     /// the hardware clock jumps.
     raw: Comparison,
+    monotonic_spans: Spans,
+    raw_spans: Spans,
+    /// Readings left out as slow, so far, and the last one's span.
+    slow: u64,
+    slow_span: u64,
     /// Whether the driver compares with the system clocks, the kernel
     /// taking a clock other than the wall clock for it.
     tight: bool,
@@ -129,6 +150,10 @@ impl Station {
             before_jump: None,
             monotonic: Comparison::default(),
             raw: Comparison::default(),
+            monotonic_spans: Spans::default(),
+            raw_spans: Spans::default(),
+            slow: 0,
+            slow_span: 0,
             tight,
             suspended: raw_ether::clock::suspended(),
             last_sync: None,
@@ -191,12 +216,36 @@ impl Station {
         self.tight
     }
 
-    fn offset(&self, clock: &HardwareClock, system: SystemClock) -> io::Result<i128> {
-        if self.tight {
-            clock.offset_from_system_clock(system)
+    /// Readings left out as slow, so far.
+    pub fn slow(&self) -> u64 {
+        self.slow
+    }
+
+    /// How long the last reading left out as slow took, in nanoseconds.
+    pub fn slow_span(&self) -> u64 {
+        self.slow_span
+    }
+
+    /// How far the hardware clock is ahead of `system`, or `None` where
+    /// the reading took too long to count.
+    fn offset(&mut self, clock: &HardwareClock, system: SystemClock) -> io::Result<Option<i128>> {
+        let reading = if self.tight {
+            clock.reading_from_system_clock(system)?
         } else {
-            clock.offset_read_against(system)
+            clock.reading_against(system)?
+        };
+        let slack = if self.tight { SLOW_TIGHT } else { SLOW_READ };
+        let spans = if system == SystemClock::MonotonicRaw {
+            &mut self.raw_spans
+        } else {
+            &mut self.monotonic_spans
+        };
+        if spans.counts(reading, slack) {
+            return Ok(Some(reading.offset));
         }
+        self.slow += 1;
+        self.slow_span = reading.span;
+        Ok(None)
     }
 
     /// Compares the hardware clock with the system's once more.
@@ -208,24 +257,29 @@ impl Station {
             return Ok(Found::Resumed);
         }
         let at = clock.now()?.as_nanos() as i128;
-        let raw = self.offset(clock, SystemClock::MonotonicRaw)?;
         let jump = if self.tight { JUMP_TIGHT } else { JUMP_READ };
         let mut found = Found::Steady;
-        if let Some(moved) = moved(&self.raw, at, raw)
-            && moved.abs() > jump
-        {
-            // Read again, to tell a clock that was set from one misread.
-            let again = self.offset(clock, SystemClock::MonotonicRaw)?;
-            if (again - raw).abs() > jump / 2 {
-                return Ok(Found::Steady);
+        // A slow reading counts towards neither line nor a jump: the next
+        // comparison, 100 ms on, tells a clock that was set.
+        if let Some(raw) = self.offset(clock, SystemClock::MonotonicRaw)? {
+            if let Some(moved) = moved(&self.raw, at, raw)
+                && moved.abs() > jump
+            {
+                // Read again, to tell a clock that was set from one
+                // misread.
+                let again = self.offset(clock, SystemClock::MonotonicRaw)?;
+                if again.is_none_or(|again| (again - raw).abs() > jump / 2) {
+                    return Ok(Found::Steady);
+                }
+                self.before_jump = self.last_timed;
+                self.restart();
+                found = Found::Jumped(moved);
             }
-            self.before_jump = self.last_timed;
-            self.restart();
-            found = Found::Jumped(moved);
+            self.raw.update(at, raw);
         }
-        self.raw.update(at, raw);
-        let monotonic = self.offset(clock, SystemClock::Monotonic)?;
-        self.follow_monotonic(at, monotonic);
+        if let Some(monotonic) = self.offset(clock, SystemClock::Monotonic)? {
+            self.follow_monotonic(at, monotonic);
+        }
         Ok(found)
     }
 
@@ -451,6 +505,26 @@ impl Station {
     }
 }
 
+/// The spans of a clock's recent readings against another's, to tell a
+/// slow one.
+#[derive(Debug, Default)]
+pub struct Spans {
+    recent: VecDeque<u64>,
+}
+
+impl Spans {
+    /// Takes `reading`'s span, and whether it took no more than `slack`
+    /// beyond the narrowest of the recent ones, this one included.
+    pub fn counts(&mut self, reading: Reading, slack: u64) -> bool {
+        if self.recent.len() == SPANS_KEPT {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(reading.span);
+        let narrowest = self.recent.iter().min().copied().unwrap_or(reading.span);
+        reading.span <= narrowest.saturating_add(slack)
+    }
+}
+
 /// How far `offset`, read at `at`, stands from what `comparison`
 /// foretells: only once it has a rate to foretell by, as two clocks free
 /// of each other drift tens of ppm apart, microseconds between readings.
@@ -575,6 +649,10 @@ mod tests {
             generation: 10,
             monotonic: Comparison::default(),
             raw: Comparison::default(),
+            monotonic_spans: Spans::default(),
+            raw_spans: Spans::default(),
+            slow: 0,
+            slow_span: 0,
             tight: false,
             suspended: Duration::ZERO,
             last_sync: None,
@@ -920,6 +998,27 @@ mod tests {
         let at = 1_000_000_000_000 + 30 * 100_000_000;
         let jumped = moved(&comparison, at, offset(at) - 3_400).expect("rate");
         assert!((jumped + 3_400).abs() < 50, "{jumped}");
+    }
+
+    #[test]
+    fn a_slow_reading_is_left_out_and_a_lasting_change_taken_up() {
+        // The I210's readings by its driver, as on the desktop: 1402 to
+        // 1433 ns as a rule, now and then 2986 to 3346 ns and some 900 ns
+        // off.
+        let reading = |span| Reading { offset: 0, span };
+        let mut spans = Spans::default();
+        for step in 0..20 {
+            assert!(spans.counts(reading(1_402 + step % 32), SLOW_TIGHT));
+        }
+        assert!(!spans.counts(reading(2_986), SLOW_TIGHT));
+        assert!(!spans.counts(reading(3_346), SLOW_TIGHT));
+        assert!(spans.counts(reading(1_433), SLOW_TIGHT));
+        // Every reading slower from now on: once the faster ones have
+        // gone from the window, they count again.
+        let counted = (0..2 * SPANS_KEPT)
+            .filter(|_| spans.counts(reading(3_000), SLOW_TIGHT))
+            .count();
+        assert_eq!(counted, SPANS_KEPT + 1);
     }
 
     #[test]

@@ -11,7 +11,9 @@ use std::io;
 use std::time::Duration;
 
 use gptp::relay::Stamp;
-use raw_ether::clock::{Comparison, HardwareClock};
+use raw_ether::clock::{Comparison, HardwareClock, Reading};
+
+use crate::station::{SLOW_TIGHT, Spans};
 
 /// How far a comparison may stand from what the last ones foretold before
 /// the port's clock is taken to have been set, as its driver does when it
@@ -25,6 +27,9 @@ enum Translation {
     Compared {
         clock: HardwareClock,
         comparison: Comparison,
+        spans: Spans,
+        /// Readings left out as slow, so far.
+        slow: u64,
         /// Comparisons that failed in a row, so as to say so once.
         failing: u32,
     },
@@ -88,6 +93,8 @@ impl Clocks {
                 Translation::Compared {
                     clock,
                     comparison: Comparison::default(),
+                    spans: Spans::default(),
+                    slow: 0,
                     failing: 0,
                 }
             };
@@ -123,12 +130,29 @@ impl Clocks {
             let Translation::Compared {
                 clock,
                 comparison,
+                spans,
+                slow,
                 failing,
             } = &mut port.translation
             else {
                 continue;
             };
-            let Some((at, offset)) = read(clock, &self.local, &port.name, failing) else {
+            // A slow reading counts towards neither the line nor a jump.
+            let mut counted = |read: Option<(i128, Reading)>| {
+                let (at, reading) = read?;
+                if spans.counts(reading, SLOW_TIGHT) {
+                    return Some((at, reading.offset));
+                }
+                *slow += 1;
+                if *slow <= 10 || crate::telling(*slow) {
+                    eprintln!(
+                        "{}: a slow reading of its clock left out, {} ns ({} so far)",
+                        port.name, reading.span, slow
+                    );
+                }
+                None
+            };
+            let Some((at, offset)) = counted(read(clock, &self.local, &port.name, failing)) else {
                 continue;
             };
             if let Some(moved) = crate::station::moved(comparison, at, offset)
@@ -136,7 +160,8 @@ impl Clocks {
             {
                 // Read again, to tell a clock that was set from a
                 // clock misread.
-                let Some((_, again)) = read(clock, &self.local, &port.name, failing) else {
+                let Some((_, again)) = counted(read(clock, &self.local, &port.name, failing))
+                else {
                     continue;
                 };
                 if (again - offset).abs() > JUMP / 2 {
@@ -191,10 +216,10 @@ fn read(
     local: &HardwareClock,
     name: &str,
     failing: &mut u32,
-) -> Option<(i128, i128)> {
+) -> Option<(i128, Reading)> {
     match clock
-        .offset_from(local)
-        .and_then(|offset| Ok((clock.now()?.as_nanos() as i128, offset)))
+        .reading_from(local)
+        .and_then(|reading| Ok((clock.now()?.as_nanos() as i128, reading)))
     {
         Ok(read) => {
             *failing = 0;
