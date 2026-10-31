@@ -1,0 +1,40 @@
+# Maintainer: Scramble Tools <https://github.com/scrambletools>
+pkgname=gptpd
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='IEEE 802.1AS gPTP daemon that never moves a clock'
+arch=('x86_64' 'aarch64' 'riscv64')
+url='https://github.com/scrambletools/gptp'
+license=('MIT OR Apache-2.0')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo')
+optdepends=('polkit: starting gptpd@INTERFACE without a password')
+backup=()
+source=("gptp-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "gptp-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "gptp-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release -p gptpd
+}
+
+check() {
+    cd "gptp-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo test --frozen --workspace
+}
+
+package() {
+    cd "gptp-$pkgver"
+    # systemd's pacman hooks make the group and reload the units.
+    scripts/dist-install.sh target/release "$pkgdir" /usr
+}

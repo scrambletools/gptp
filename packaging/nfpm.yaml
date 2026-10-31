@@ -1,0 +1,54 @@
+# Debian and RPM packages, made with nfpm (https://nfpm.goreleaser.com)
+# from a tree staged by scripts/dist-install.sh:
+#
+#   scripts/dist-install.sh target/release stage /usr
+#   VERSION=0.1.0 ARCH=amd64 nfpm package -f packaging/nfpm.yaml -p deb
+#   VERSION=0.1.0 ARCH=amd64 nfpm package -f packaging/nfpm.yaml -p rpm
+name: gptpd
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+release: 1
+section: net
+priority: optional
+maintainer: Scramble Tools <https://github.com/scrambletools>
+vendor: Scramble Tools
+homepage: https://github.com/scrambletools/gptp
+license: MIT OR Apache-2.0
+description: |-
+  IEEE 802.1AS gPTP daemon that never moves a clock
+  gptpd runs gPTP on a network interface with hardware time stamps, as an
+  end station or across a Linux bridge's ports, without stepping or
+  slewing any hardware clock. Applications read the grandmaster's time as
+  a mapping from /run/gptpd, and its state from a socket there. On an
+  endpoint it falls back to the AVB Lite PTP profile where no AVB bridge
+  is the neighbor.
+
+contents:
+  - src: ./stage/usr/
+    dst: /usr
+    type: tree
+  - dst: /etc/gptpd
+    type: dir
+    file_info:
+      mode: 0755
+
+scripts:
+  postinstall: ./packaging/linux/postinstall.sh
+
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.34)
+      - libgcc-s1
+    recommends:
+      - polkitd | policykit-1
+  rpm:
+    depends:
+      - glibc >= 2.34
+    recommends:
+      - polkit
+
+rpm:
+  group: System Environment/Daemons
+  summary: IEEE 802.1AS gPTP daemon that never moves a clock

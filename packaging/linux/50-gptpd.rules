@@ -1,0 +1,12 @@
+// Lets the person at the computer start, stop and restart gptpd on an
+// interface, as triib and plaa do for their entities, without a password.
+polkit.addRule(function (action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        /^gptpd@[^\/]+\.service$/.test(action.lookup("unit")) &&
+        subject.local && subject.active) {
+        var verb = action.lookup("verb");
+        if (verb == "start" || verb == "stop" || verb == "restart") {
+            return polkit.Result.YES;
+        }
+    }
+});
