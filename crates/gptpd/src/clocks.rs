@@ -10,8 +10,8 @@
 use std::io;
 use std::time::Duration;
 
-use avb_gptp::relay::Stamp;
 use avb_net::clock::{Comparison, HardwareClock};
+use gptp::relay::Stamp;
 
 /// How far a comparison may stand from what the last ones foretold before
 /// the port's clock is taken to have been set, as its driver does when it

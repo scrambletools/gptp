@@ -1,5 +1,5 @@
-//! avb-gptpd: an 802.1AS time-aware relay on a Linux bridge's ports. It
-//! runs avb-gptp's relay with each port's gPTP frames on a raw socket,
+//! gptpd: an 802.1AS time-aware relay on a Linux bridge's ports. It
+//! runs gptp's relay with each port's gPTP frames on a raw socket,
 //! hardware time stamped, and the ports' clocks made into one LocalClock
 //! in software, so that no clock is ever stepped or slewed and nothing
 //! the network does shows in what the neighbors measure.
@@ -11,10 +11,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use avb_gptp::relay::{Config, Event, Relay, Stamp};
-use avb_gptp::{ClockIdentity, DESTINATION, ETHERTYPE_GPTP, MessageType};
 use avb_net::MacAddress;
 use avb_net::stamped::{self, StampedSocket};
+use gptp::relay::{Config, Event, Relay, Stamp};
+use gptp::{ClockIdentity, DESTINATION, ETHERTYPE_GPTP, MessageType};
 
 use crate::clocks::Clocks;
 
@@ -36,7 +36,7 @@ const STATUS_EVERY: Duration = Duration::from_secs(1);
 const STAMP_WAIT: Duration = Duration::from_millis(20);
 
 const USAGE: &str = "\
-usage: avb-gptpd [options] INTERFACE...
+usage: gptpd [options] INTERFACE...
   INTERFACE           a port to run gPTP on, numbered from 1 in the order
                       given
   --bridge NAME       run each port only while it is a member of this
@@ -45,7 +45,7 @@ usage: avb-gptpd [options] INTERFACE...
   --clock INTERFACE   the interface whose hardware clock is the LocalClock,
                       a port or not (the first port)
   --status PATH       where to write how gPTP stands
-                      (/run/avb-gptpd/status)";
+                      (/run/gptpd/status)";
 
 struct Options {
     ports: Vec<String>,
@@ -59,7 +59,7 @@ fn options() -> Result<Options, String> {
         ports: Vec::new(),
         bridge: None,
         clock: None,
-        status: PathBuf::from("/run/avb-gptpd/status"),
+        status: PathBuf::from("/run/gptpd/status"),
     };
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {

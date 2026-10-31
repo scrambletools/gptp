@@ -35,8 +35,8 @@ moved after it starts.
 
 ## Goals
 
-- Replace ptp4l and phc2sys on the bridge with one daemon, `avb-gptpd`,
-  built on a protocol crate, `avb-gptp`, in the avb workspace.
+- Replace ptp4l and phc2sys on the bridge with one daemon, `gptpd`,
+  built on a protocol crate, `gptp`, in the avb workspace.
 - A time-aware relay for domain 0 over full-duplex Ethernet with the
   instance-specific peer-to-peer delay mechanism, as 802.1AS-2011 and
   802.1AS-2020 both define it, so it works with what is on the bench:
@@ -45,7 +45,7 @@ moved after it starts.
   slewed because of anything the network does. A grandmaster change or
   a boot is invisible in the neighbors' Pdelay measurements.
 - The bridge is not grandmaster capable (priority1 255), as now.
-- `avb-bridged` takes each port's asCapable from `avb-gptpd` instead of
+- `avb-bridged` takes each port's asCapable from `gptpd` instead of
   asking ptp4l.
 
 Not in the first version: being grandmaster, more than one domain, CMLDS
@@ -61,7 +61,7 @@ root port lacks Precision Time Measurement, so the PHCs offer no cross
 time stamping (`phc_ctl caps`: "doesn't have cross timestamping
 support").
 
-So `avb-gptpd` makes one LocalClock over them, in software:
+So `gptpd` makes one LocalClock over them, in software:
 
 - Each port's PHC stamps that port's messages, and its neighbor sees only
   that clock. No PHC is stepped or slewed, ever: each runs at its own
@@ -100,7 +100,7 @@ LocalClock's card was reset.
 
 The comparison's error adds to every residence time. The target is under
 100 ns: `avb-residence` measured the same comparison at a standard
-deviation under 50 ns, and the grandmaster time `avb-gptpd` worked out
+deviation under 50 ns, and the grandmaster time `gptpd` worked out
 from each Sync, on one port against ptp4l's and through the comparison,
 stood -5 ns from ptp4l's with a standard deviation of 50 ns. Anything
 that later needs the grandmaster's time on a PHC, such as launch times
@@ -109,7 +109,7 @@ offset and rate, rather than moving a clock.
 
 ## The protocol
 
-`avb-gptp` follows the state machines of 802.1AS-2020, clauses 10 and
+`gptp` follows the state machines of 802.1AS-2020, clauses 10 and
 11, and their names, for domain 0:
 
 - **Link (clause 11):** per port, the MDPdelayReq requester and
@@ -155,15 +155,15 @@ simulated clocks, and leaves it usable without `std`.
 
 ## The daemon
 
-`avb-gptpd`, in Linux-AVB-Bridge:
+`gptpd`, in Linux-AVB-Bridge:
 
 - A raw socket per port for ethertype 0x88F7, with hardware time
   stamping on (transmit on, receive filter all, as ptp4l sets today);
   transmit times come back on the error queue.
 - The LocalClock above.
-- One thread running `avb-gptp`, its sockets and its timers.
+- One thread running `gptp`, its sockets and its timers.
 - Its state for people and for `avb-bridged` in
-  `/run/avb-gptpd/status`: per port asCapable, role, link delay, rate
+  `/run/gptpd/status`: per port asCapable, role, link delay, rate
   ratio; the grandmaster, its time and rate against the LocalClock.
 - A port runs only while it is in the bridge, so a port taken out for a
   loop test is left be.
@@ -176,16 +176,16 @@ Hardware time stamping and PHC adjustment go into `avb-net`, next to its
 
 ## Testing
 
-- **Unit tests** in `avb-gptp`: messages from today's captures (the
+- **Unit tests** in `gptp`: messages from today's captures (the
   PreSonus, the 8D, the Mac and the ESP boards) parse and rebuild byte
   for byte; link, BTCA and relay state machines against scripted
   neighbors with simulated clocks, including rate offsets, a neighbor's
   step, a grandmaster's departure and return, and a boot.
-- **One port against ptp4l:** `avb-gptpd` on the loop port, with ptp4l
+- **One port against ptp4l:** `gptpd` on the loop port, with ptp4l
   on the bridge port at the far end, its grandmaster time checked
   against the far port's PHC, which ptp4l and phc2sys keep on the
   grandmaster's time.
-- **Bench windows** agreed with the ESP session: `avb-gptpd` replaces
+- **Bench windows** agreed with the ESP session: `gptpd` replaces
   ptp4l on scrambox, then the boards' own offsets and asCapable, the
   PreSonus's Sync, and captures of our Follow_Up corrections against the
   boards' measured time. The acceptance test is a reboot, and a
@@ -193,14 +193,14 @@ Hardware time stamping and PHC adjustment go into `avb-net`, next to its
 
 ## Steps
 
-1. `avb-gptp`: the messages and TLVs, encoded and decoded, tested on
+1. `gptp`: the messages and TLVs, encoded and decoded, tested on
    recorded frames.
 2. The link: Pdelay requester and responder, rate ratio, asCapable.
 3. Announce, the BTCA and port roles.
 4. The Sync relay and the time arithmetic.
 5. `avb-net`: hardware time stamps on raw sockets, PHC frequency and
    offset reads.
-6. `avb-gptpd`: the LocalClock, the event loop, the status file, the
+6. `gptpd`: the LocalClock, the event loop, the status file, the
    unit and the switch.
-7. `avb-bridged` on `avb-gptpd`'s asCapable.
+7. `avb-bridged` on `gptpd`'s asCapable.
 8. Bench windows, then a release.

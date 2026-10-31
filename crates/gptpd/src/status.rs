@@ -8,7 +8,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use avb_gptp::relay::Role;
+use gptp::relay::Role;
 
 use crate::{Daemon, number};
 
