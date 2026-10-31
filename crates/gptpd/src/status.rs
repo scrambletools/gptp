@@ -98,6 +98,126 @@ pub(crate) fn text(daemon: &Daemon) -> String {
     text
 }
 
+/// An end station's state, as clients read it from its socket.
+pub(crate) fn snapshot(daemon: &Daemon) -> gptp::status::Status {
+    use gptp::status::{Counters, Fallback, Grandmaster, Port, Profile, Status};
+    let relay = &daemon.relay;
+    let end = daemon.end_station.as_ref();
+    let grandmaster = relay.grandmaster().map(|grandmaster| Grandmaster {
+        identity: grandmaster.clock,
+        priority1: grandmaster.priority1,
+        clock_class: grandmaster.clock_class,
+        clock_accuracy: grandmaster.clock_accuracy,
+        offset_scaled_log_variance: grandmaster.offset_scaled_log_variance,
+        priority2: grandmaster.priority2,
+        steps_removed: relay.steps_removed(),
+        is_us: grandmaster.clock == daemon.identity,
+    });
+    let ports = daemon
+        .ports
+        .iter()
+        .enumerate()
+        .map(|(index, port)| {
+            let number = number(index);
+            let link = relay.link(number);
+            Port {
+                name: port.name.clone(),
+                up: port.up,
+                as_capable: relay.as_capable(number),
+                role: relay.role(number).unwrap_or(Role::Disabled),
+                link_delay: link.map(|link| link.mean_link_delay.round() as i64),
+                neighbor: link.map(|link| link.neighbor),
+                neighbor_rate_ratio: link.map(|link| link.neighbor_rate_ratio),
+            }
+        })
+        .collect();
+    let lite = end.map(|end| &end.lite);
+    let fallback = match lite.and_then(crate::lite::Lite::reason) {
+        None => Fallback::None,
+        Some(gptp::lite::Reason::EndpointTlv) => Fallback::EndpointTlv,
+        Some(gptp::lite::Reason::PdelayUnanswered) => Fallback::PdelayUnanswered,
+        Some(gptp::lite::Reason::MultipleResponders) => Fallback::MultipleResponders,
+        Some(gptp::lite::Reason::Configured) => Fallback::Configured,
+    };
+    if let Some(lite) = lite.filter(|lite| lite.active()) {
+        return lite_snapshot(daemon, lite, fallback);
+    }
+    Status {
+        clock: daemon.identity,
+        domain: 0,
+        priority1: relay.identity().priority1,
+        profile: Profile::Gptp,
+        fallback,
+        grandmaster,
+        path: relay.path_trace(),
+        generation: end.map_or(0, |end| end.station.generation()),
+        residual: end.and_then(|end| end.station.residual()),
+        ports,
+        counters: Counters {
+            grandmaster_changes: daemon.counts.grandmaster_changes,
+            link_ups: daemon.counts.link_ups,
+            link_downs: daemon.counts.link_downs,
+            sync_timeouts: daemon.counts.sync_timeouts,
+        },
+    }
+}
+
+/// An end station's state while it runs the AVB Lite profile: the
+/// grandmaster its end-to-end client follows, and the path's delay.
+fn lite_snapshot(
+    daemon: &Daemon,
+    lite: &crate::lite::Lite,
+    fallback: gptp::status::Fallback,
+) -> gptp::status::Status {
+    use gptp::status::{Counters, Grandmaster, Port, Profile, Status};
+    let client = &lite.client;
+    let grandmaster = client.grandmaster().map(|grandmaster| Grandmaster {
+        identity: grandmaster.clock,
+        priority1: grandmaster.priority1,
+        clock_class: grandmaster.clock_class,
+        clock_accuracy: grandmaster.clock_accuracy,
+        offset_scaled_log_variance: grandmaster.offset_scaled_log_variance,
+        priority2: grandmaster.priority2,
+        steps_removed: 1,
+        is_us: false,
+    });
+    let end = daemon.end_station.as_ref();
+    let port = &daemon.ports[0];
+    Status {
+        clock: daemon.identity,
+        domain: 0,
+        priority1: 255,
+        profile: Profile::AvbLite,
+        fallback,
+        grandmaster,
+        path: grandmaster
+            .map(|grandmaster| vec![grandmaster.identity, daemon.identity])
+            .unwrap_or_else(|| vec![daemon.identity]),
+        generation: end.map_or(0, |end| end.station.generation()),
+        residual: end.and_then(|end| end.station.residual()),
+        ports: vec![Port {
+            name: port.name.clone(),
+            up: port.up,
+            // AVB Lite has no asCapable: the path is measured end to end.
+            as_capable: false,
+            role: if grandmaster.is_some() {
+                Role::TimeReceiver
+            } else {
+                Role::Disabled
+            },
+            link_delay: client.mean_path_delay().map(|delay| delay.round() as i64),
+            neighbor: None,
+            neighbor_rate_ratio: None,
+        }],
+        counters: Counters {
+            grandmaster_changes: daemon.counts.grandmaster_changes,
+            link_ups: daemon.counts.link_ups,
+            link_downs: daemon.counts.link_downs,
+            sync_timeouts: daemon.counts.sync_timeouts,
+        },
+    }
+}
+
 /// Writes `text` to `path` whole, through a file beside it.
 pub fn write(path: &Path, text: &str) -> io::Result<()> {
     if let Some(folder) = path.parent() {

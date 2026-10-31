@@ -1,0 +1,38 @@
+[Unit]
+Description=gPTP (802.1AS) end station on %I
+After=network-online.target
+Wants=network-online.target
+# One PTP daemon per port: starting this stops linuxptp's on the same
+# interface, and starting one of those stops this. Ordered too, so the
+# stop is done before the start: two responders to one Pdelay_Req, even
+# once, make a strict neighbor fall back to plain PTP.
+Conflicts=triib-ptp4l-gptp@%i.service triib-ptp4l-lite@%i.service plaa-ptp4l@%i.service plaa-ptp4l-lite@%i.service
+After=triib-ptp4l-gptp@%i.service triib-ptp4l-lite@%i.service plaa-ptp4l@%i.service plaa-ptp4l-lite@%i.service
+# However often it fails, start it again: three unanswered Pdelay
+# requests, 3 s, and the neighbor counts the link not asCapable.
+StartLimitIntervalSec=0
+
+[Service]
+# It refuses, exiting 3, while a ptp4l started by hand holds the
+# interface, saying why in /run/gptpd/%i.refused; not restarted then.
+ExecStart=/usr/local/bin/gptpd %i
+Restart=always
+RestartSec=1
+RestartPreventExitStatus=3
+# /run/gptpd holds every instance's time file, socket and status, readable
+# by anyone; one instance stopping leaves the others' be.
+RuntimeDirectory=gptpd
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+Group=gptpd
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+# Above every other program but below the streams (round robin 15), and
+# kept in RAM (it locks itself), so neither builds nor swapping delay a
+# frame long enough to read as a Sync or a Pdelay response lost.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=10
+LimitMEMLOCK=infinity
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

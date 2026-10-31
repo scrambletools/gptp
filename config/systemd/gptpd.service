@@ -24,6 +24,12 @@ Restart=on-failure
 # crossing it.
 RestartSec=1
 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+# Above every other program but below the streams (round robin 15), and
+# kept in RAM (it locks itself), so neither builds nor swapping delay a
+# frame long enough to read as a Sync or a Pdelay response lost.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=10
+LimitMEMLOCK=infinity
 NoNewPrivileges=yes
 
 [Install]

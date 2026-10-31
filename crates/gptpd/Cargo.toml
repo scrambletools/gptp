@@ -1,6 +1,6 @@
 [package]
 name = "gptpd"
-description = "An 802.1AS time-aware relay on a Linux bridge's ports, running gptp's relay with hardware time stamps and clocks that are never moved"
+description = "An 802.1AS daemon, a time-aware relay on a Linux bridge's ports or an end station, running gptp with hardware time stamps and clocks that are never moved"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -12,5 +12,6 @@ publish = false
 workspace = true
 
 [dependencies]
-avb-net.workspace = true
+raw-ether.workspace = true
 gptp.workspace = true
+libc = "0.2"

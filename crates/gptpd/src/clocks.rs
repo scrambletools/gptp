@@ -10,8 +10,8 @@
 use std::io;
 use std::time::Duration;
 
-use avb_net::clock::{Comparison, HardwareClock};
 use gptp::relay::Stamp;
+use raw_ether::clock::{Comparison, HardwareClock};
 
 /// How far a comparison may stand from what the last ones foretold before
 /// the port's clock is taken to have been set, as its driver does when it
@@ -44,7 +44,7 @@ pub struct Clocks {
 
 /// An interface's hardware clock index.
 fn index_of(interface: &str) -> Result<u32, String> {
-    avb_net::interfaces()
+    raw_ether::interfaces()
         .into_iter()
         .find(|each| each.name == interface)
         .and_then(|each| each.hardware_clock)
@@ -107,6 +107,11 @@ impl Clocks {
         &self.local_name
     }
 
+    /// The LocalClock itself.
+    pub fn local_clock(&self) -> &HardwareClock {
+        &self.local
+    }
+
     /// The LocalClock's time, in nanoseconds.
     pub fn now(&self) -> io::Result<i128> {
         Ok(self.local.now()?.as_nanos() as i128)
@@ -126,23 +131,22 @@ impl Clocks {
             let Some((at, offset)) = read(clock, &self.local, &port.name, failing) else {
                 continue;
             };
-            if !comparison.is_empty() {
-                let moved = offset - comparison.offset_at(at);
-                if moved.abs() > JUMP {
-                    // Read again, to tell a clock that was set from a
-                    // clock misread.
-                    let Some((_, again)) = read(clock, &self.local, &port.name, failing) else {
-                        continue;
-                    };
-                    if (again - offset).abs() > JUMP / 2 {
-                        continue;
-                    }
-                    eprintln!(
-                        "{}: its clock moved {moved} ns against the LocalClock; comparing afresh",
-                        port.name
-                    );
-                    comparison.clear();
+            if let Some(moved) = crate::station::moved(comparison, at, offset)
+                && moved.abs() > JUMP
+            {
+                // Read again, to tell a clock that was set from a
+                // clock misread.
+                let Some((_, again)) = read(clock, &self.local, &port.name, failing) else {
+                    continue;
+                };
+                if (again - offset).abs() > JUMP / 2 {
+                    continue;
                 }
+                eprintln!(
+                    "{}: its clock moved {moved} ns against the LocalClock; comparing afresh",
+                    port.name
+                );
+                comparison.clear();
             }
             comparison.update(at, offset);
         }
