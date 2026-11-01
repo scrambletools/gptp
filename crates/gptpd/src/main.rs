@@ -192,6 +192,11 @@ struct Port {
     missed: u64,
     /// Link delay measurements left out as outliers.
     outliers: u64,
+    /// Whether the card stamps every frame, general messages too, as an
+    /// I210 or i226 does: then one without a time is a fault.
+    stamps_every_frame: bool,
+    /// Times left out, the frame after them having come without one.
+    distrusted: u64,
 }
 
 /// What an end station has beyond a relay of one port.
@@ -339,6 +344,12 @@ impl Daemon {
             // Sync, Delay_Req, Pdelay_Req and Pdelay_Resp: of no use
             // without the time they came.
             let event = frame.first().is_some_and(|octet| octet & 0x0f < 4);
+            if received.time.is_some() && !event {
+                self.ports[index].stamps_every_frame = true;
+            }
+            if received.time.is_none() && self.ports[index].stamps_every_frame {
+                self.distrust_last(index);
+            }
             let time = match received.time {
                 Some(time) => self.clocks.stamp(index, time),
                 None if event => continue,
@@ -349,6 +360,27 @@ impl Daemon {
             if let Some(end) = &mut self.end_station {
                 end.lite.handle_frame(now, frame, time.port);
             }
+        }
+    }
+
+    /// A frame on port `index` came without a time, from a card that
+    /// stamps every frame: the one before it may carry its time.
+    fn distrust_last(&mut self, index: usize) {
+        let Some(message_type) = self.relay.handle_unstamped(number(index)) else {
+            return;
+        };
+        let port = &mut self.ports[index];
+        port.distrusted += 1;
+        let count = port.distrusted;
+        if count <= 10 || telling(count) {
+            let what = match message_type {
+                MessageType::PdelayResp => "a Pdelay exchange",
+                _ => "a Sync",
+            };
+            eprintln!(
+                "{}: {what} left out, the frame after it came without a time stamp ({count} so far)",
+                port.name
+            );
         }
     }
 
@@ -878,6 +910,8 @@ fn run(options: Options) -> Result<(), String> {
             up: false,
             missed: 0,
             outliers: 0,
+            stamps_every_frame: false,
+            distrusted: 0,
         });
     }
     let end_station = match options.station() {

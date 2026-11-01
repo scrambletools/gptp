@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+- gptp: `Relay::handle_unstamped` and `Link::distrust_response`. A frame
+  that came without a hardware time stamp, from a card that stamps every
+  frame, leaves the frame before it distrusted: an I210 can give one
+  frame the next one's time. A distrusted Pdelay exchange is left out of
+  the delay and the rate, up to `ALLOWED_DISTRUSTED_EXCHANGES` in a row,
+  and a distrusted Sync's time is not taken.
+
 ## [0.1.0] - 2026-10-31
 
 The first release: gptp and raw-ether on crates.io, and gptpd's packages.
@@ -18,3 +27,7 @@ The first release: gptp and raw-ether on crates.io, and gptpd's packages.
   `/run/gptpd/<interface>.time` and its state from
   `/run/gptpd/<interface>.sock`. Packages for Debian, Ubuntu and Fedora
   on x86_64, ARM64 and RISC-V, and a PKGBUILD.
+- gptpd leaves out, and logs, a Pdelay exchange or Sync whose frame may
+  carry the next frame's time, as an I210 can give it. It does so with
+  gptp's `Relay::handle_unstamped`, which reaches crates.io in gptp's
+  next release.

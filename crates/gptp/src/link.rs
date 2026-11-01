@@ -14,6 +14,13 @@
 //! row, so a step costs one measurement rather than asCapable. A neighbor
 //! whose rate is implausible from the first measurement stays not
 //! asCapable.
+//!
+//! A card that stamps every frame can give one frame the time of the
+//! next and that one none, as the I210 does now and then with two frames
+//! some 10 us apart: a response so stamped gives a delay half that gap
+//! too long. The caller says so with
+//! [`distrust_response`](Link::distrust_response), and the exchange is
+//! left out, of the delay and the rate.
 
 use core::time::Duration;
 
@@ -121,6 +128,12 @@ pub struct Measurement {
     pub neighbor: PortIdentity,
 }
 
+/// Distrusted exchanges in a row left out, after which they are taken
+/// as any other, so a port whose every response is distrusted is still
+/// measured: some 25 come at a time where a neighbor's Follow_Up follows
+/// its response closely.
+pub const ALLOWED_DISTRUSTED_EXCHANGES: u8 = 60;
+
 const RESPONSE_CONTROL: u8 = 5;
 const NO_INTERVAL: i8 = 0x7f;
 
@@ -134,6 +147,8 @@ struct Request {
     response: Option<(PortIdentity, i128, i128)>,
     /// A second port answered the same request.
     multiple: bool,
+    /// The response's time stamp may be another frame's.
+    distrusted: bool,
 }
 
 /// One port's peer delay requester and responder.
@@ -159,6 +174,8 @@ pub struct Link {
     /// The last delay measurement left out, with the median it stood from,
     /// until taken.
     outlier: Option<(f64, f64)>,
+    /// Distrusted exchanges in a row.
+    distrusted: u8,
     neighbor: Option<PortIdentity>,
     multiple_responders: u8,
 }
@@ -190,6 +207,7 @@ impl Link {
             changed: DelayFilter::new(config.delay_samples),
             delay_outliers: 0,
             outlier: None,
+            distrusted: 0,
             neighbor: None,
             multiple_responders: 0,
         }
@@ -288,6 +306,7 @@ impl Link {
             sent: None,
             response: None,
             multiple: false,
+            distrusted: false,
         });
         Some(Transmit {
             message: Message {
@@ -344,6 +363,22 @@ impl Link {
             }
             _ => None,
         }
+    }
+
+    /// Distrusts the time stamp of the response to request `sequence`, the
+    /// frame heard after it having come without one: the response may
+    /// carry that frame's time. Whether such a response waits for its
+    /// follow up.
+    pub fn distrust_response(&mut self, sequence: u16) -> bool {
+        let Some(request) = self
+            .request
+            .as_mut()
+            .filter(|request| request.sequence == sequence && request.response.is_some())
+        else {
+            return false;
+        };
+        request.distrusted = true;
+        true
     }
 
     /// A Pdelay message heard on the port, `received` its arrival on the
@@ -419,6 +454,14 @@ impl Link {
                     self.forget_neighbor();
                 }
                 self.neighbor = Some(responder);
+                if request.distrusted {
+                    self.distrusted = self.distrusted.saturating_add(1);
+                    if self.distrusted <= ALLOWED_DISTRUSTED_EXCHANGES {
+                        return None;
+                    }
+                } else {
+                    self.distrusted = 0;
+                }
                 let t3 = response_origin.nanos() + correction_nanos(message.header.correction);
                 self.measure(t1, t2, t3, t4);
                 None
@@ -498,6 +541,7 @@ impl Link {
         self.delays.clear();
         self.changed.clear();
         self.delay_outliers = 0;
+        self.distrusted = 0;
         self.neighbor = None;
     }
 

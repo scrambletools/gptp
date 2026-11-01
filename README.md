@@ -132,6 +132,9 @@ capability and the AVB Lite profile.
   exchange is left out, its rate too, unless fifteen in a row say the
   link changed, and then the rate starts afresh from there. Each left out
   is logged with its size.
+- On a card that stamps every frame, a frame that comes without a time
+  leaves the one before it distrusted, as it may carry that frame's time:
+  its Pdelay exchange or Sync is left out, and logged.
 - A port no longer asCapable says why in the log, and its delay when that
   is the reason.
 

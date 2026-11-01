@@ -126,10 +126,16 @@ must ride that out without losing asCapable:
 - The link delay is the median of recent exchanges. An exchange far from
   it is left out, with its rate, and logged. Fifteen in a row away from
   the median count as the link having changed, and the rate starts afresh
-  across the change. A neighbor that pairs two of its own frames back to
-  back on a port can put one frame time, about 10 µs, into a stamp; a
-  shorter run of such outliers once became the median and cost asCapable
-  for 20 s.
+  across the change. A shorter run of such outliers once became the
+  median and cost asCapable for 20 s.
+- A card that stamps every frame, as the I210 and i226 do, can now and
+  then give one frame the time of the next and that one none. An I210
+  did so with a neighbor's Pdelay_Resp and the Follow_Up 9.76 µs behind
+  it, for delays 4.88 µs long. So where a frame comes without a time on
+  such a port, the frame before it is distrusted: a Pdelay exchange is
+  left out, of the delay and the rate, and a Sync's time is not taken.
+  Sixty exchanges in a row so left out are taken after all, so a port is
+  never left unmeasured.
 - A Sync that moves the line by more than 5 µs is held back until a later
   Sync says the same, and dropped otherwise.
 - A Sync is judged on the hardware clock, and the comparison with

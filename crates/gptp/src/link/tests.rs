@@ -596,3 +596,102 @@ fn a_run_of_bad_stamps_from_a_busy_neighbor_costs_neither_as_capable_nor_the_rat
     let capable = replay(&mut link, 17, &[25_000; 8], &[0; 8]);
     assert!(capable.iter().all(|&capable| capable), "{capable:?}");
 }
+
+/// Runs one exchange a second from `start`, each response marked in
+/// `late` stamped `late_by` after it came, as an I210 now and then stamps
+/// one with the time of a frame 9.76 us behind it, and distrusted where
+/// `distrust` says: whether the port was asCapable after each.
+fn stamped_late(
+    link: &mut Link,
+    start: u64,
+    late: &[bool],
+    late_by: i128,
+    distrust: bool,
+) -> Vec<bool> {
+    let neighbor = Neighbor {
+        delay: 4,
+        ..switch()
+    };
+    let mut capable = Vec::new();
+    for (index, &late) in late.iter().enumerate() {
+        let second = start + index as u64;
+        let request = link
+            .handle_timeout(Duration::from_secs(second))
+            .expect("a request each second");
+        let sequence = request.message.header.sequence_id;
+        let t1 = SECOND + i128::from(second) * SECOND;
+        link.handle_transmit_time(MessageType::PdelayReq, sequence, t1);
+        let (response, follow_up, t4) = neighbor.answer(&request.message, t1);
+        link.handle_message(&response, if late { t4 + late_by } else { t4 });
+        if late && distrust {
+            assert!(link.distrust_response(sequence));
+        }
+        link.handle_message(&follow_up, t4 + 1_000_000);
+        capable.push(link.as_capable());
+    }
+    capable
+}
+
+#[test]
+fn responses_stamped_with_the_next_frames_time_are_left_out_when_distrusted() {
+    // As the desktop's I210 stamped them in the MOTU's windows: some 25 in
+    // a minute, as many as 20 in a row.
+    let mut link = link();
+    stamped_late(&mut link, 0, &[false; 8], 0, true);
+    let before = link.measurement().expect("measured");
+    let capable = stamped_late(&mut link, 8, &[true; 20], 9_760, true);
+    assert!(capable.iter().all(|&capable| capable), "{capable:?}");
+    assert_eq!(link.measurement(), Some(before));
+    let pattern: Vec<bool> = (0..40).map(|index| index % 3 != 1).collect();
+    let capable = stamped_late(&mut link, 28, &pattern, 9_760, true);
+    assert!(capable.iter().all(|&capable| capable), "{capable:?}");
+    let measurement = link.measurement().expect("measured");
+    assert!(
+        (measurement.mean_link_delay - 4.0).abs() < 2.0,
+        "{measurement:?}"
+    );
+    assert!(
+        (measurement.neighbor_rate_ratio - switch().rate).abs() < 1e-9,
+        "{measurement:?}"
+    );
+}
+
+#[test]
+fn undistrusted_a_run_of_them_is_taken_for_a_changed_link() {
+    let mut link = link();
+    stamped_late(&mut link, 0, &[false; 8], 0, true);
+    let capable = stamped_late(&mut link, 8, &[true; 20], 9_760, false);
+    assert!(!capable.last().expect("ran"));
+}
+
+#[test]
+fn a_neighbor_whose_every_response_is_distrusted_is_still_measured() {
+    // A card that drops the next frame's time stamp but stamps the
+    // response right: distrusted every time, and good.
+    let mut link = link();
+    let allowed = usize::from(ALLOWED_DISTRUSTED_EXCHANGES);
+    let capable = stamped_late(&mut link, 0, &std::vec![true; allowed + 4], 0, true);
+    assert!(!capable[allowed - 1]);
+    assert!(
+        capable.last().is_some_and(|&capable| capable),
+        "{capable:?}"
+    );
+}
+
+#[test]
+fn only_a_response_waiting_for_its_follow_up_is_distrusted() {
+    let mut link = link();
+    stamped_late(&mut link, 0, &[false; 8], 0, true);
+    let request = link
+        .handle_timeout(Duration::from_secs(8))
+        .expect("a request");
+    let sequence = request.message.header.sequence_id;
+    assert!(!link.distrust_response(sequence), "no response yet");
+    let t1 = 9 * SECOND;
+    link.handle_transmit_time(MessageType::PdelayReq, sequence, t1);
+    let (response, follow_up, t4) = switch().answer(&request.message, t1);
+    link.handle_message(&response, t4);
+    assert!(!link.distrust_response(sequence.wrapping_add(1)));
+    link.handle_message(&follow_up, t4 + 1_000);
+    assert!(!link.distrust_response(sequence), "already followed up");
+}

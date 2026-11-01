@@ -932,3 +932,49 @@ fn a_lone_port_going_down_is_no_takeover() {
         )
     );
 }
+
+#[test]
+fn a_sync_followed_by_a_frame_without_a_time_stamp_is_left_out() {
+    let mut bench = Bench::new(std::vec![grandmaster()]);
+    bench.run(Duration::from_secs(8));
+    let gm = grandmaster();
+    let synced = bench.relay.last_sync();
+    assert_eq!(
+        bench.relay.handle_unstamped(gm.port),
+        None,
+        "after a Follow_Up"
+    );
+    bench.now += Duration::from_millis(125);
+    bench.sequence = bench.sequence.wrapping_add(1);
+    let sync = Message {
+        header: gm.header(
+            bench.sequence,
+            Flags::TWO_STEP | Flags::PTP_TIMESCALE,
+            0,
+            -3,
+        ),
+        body: Body::Sync {
+            origin: Timestamp::default(),
+        },
+        tlvs: &[],
+    };
+    bench.deliver(gm.port, &sync, local(bench.now));
+    assert_eq!(bench.relay.handle_unstamped(2), None, "another port");
+    assert_eq!(
+        bench.relay.handle_unstamped(gm.port),
+        Some(MessageType::Sync)
+    );
+    assert_eq!(bench.relay.handle_unstamped(gm.port), None, "once");
+    let follow_up = Message {
+        header: gm.header(bench.sequence, Flags::PTP_TIMESCALE, 2, -3),
+        body: Body::FollowUp {
+            precise_origin: Timestamp::from_nanos(gm.clock(local(bench.now) - gm.delay))
+                .expect("origin"),
+        },
+        tlvs: &[],
+    };
+    bench.deliver(gm.port, &follow_up, local(bench.now) + 2_000);
+    assert_eq!(bench.relay.last_sync(), synced);
+    bench.run(bench.now + Duration::from_millis(125));
+    assert_eq!(bench.relay.last_sync(), Some(local(bench.now)));
+}

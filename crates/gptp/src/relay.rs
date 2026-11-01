@@ -299,6 +299,9 @@ struct Port {
     next_capable: Option<Duration>,
     capable_until: Option<Duration>,
     signaling_sequence: u16,
+    /// The last message heard on the port, for one that comes after it
+    /// without a time stamp.
+    last_heard: Option<(MessageType, u16)>,
 }
 
 /// A time-aware relay across its ports.
@@ -369,6 +372,7 @@ impl Relay {
                 next_capable: None,
                 capable_until: None,
                 signaling_sequence: 0,
+                last_heard: None,
             })
             .collect();
         Self {
@@ -469,6 +473,7 @@ impl Relay {
         if !up {
             port.information = None;
             port.capable_until = None;
+            port.last_heard = None;
         }
         self.check_capable(now, number);
         self.select(now);
@@ -494,6 +499,7 @@ impl Relay {
         if !self.ports[index].up {
             return;
         }
+        self.ports[index].last_heard = Some((message.message_type(), message.header.sequence_id));
         match message.message_type() {
             MessageType::PdelayReq | MessageType::PdelayResp | MessageType::PdelayRespFollowUp => {
                 let link = &mut self.ports[index].link;
@@ -526,6 +532,37 @@ impl Relay {
             }
             // 1588's end-to-end exchange, which gPTP does not use.
             MessageType::DelayReq | MessageType::DelayResp => {}
+        }
+    }
+
+    /// A frame heard on port `number` came without a hardware time stamp,
+    /// from a card that stamps every frame: the frame heard just before it
+    /// may carry its time, as an I210 now and then gives one frame the
+    /// next one's. That frame's time is left out where it counts, a
+    /// Pdelay_Resp's exchange or the timereceiver port's Sync, before its
+    /// follow up comes. Says which, if either. The caller tells this
+    /// before it hands over the frame, if at all.
+    pub fn handle_unstamped(&mut self, number: u16) -> Option<MessageType> {
+        let index = self.index(number)?;
+        let (message_type, sequence) = self.ports[index].last_heard.take()?;
+        match message_type {
+            MessageType::PdelayResp => self.ports[index]
+                .link
+                .distrust_response(sequence)
+                .then_some(message_type),
+            MessageType::Sync => {
+                let waiting = self.upstream.is_some_and(|upstream| {
+                    upstream.sequence == sequence && upstream.follow_up.is_none()
+                });
+                if self.receiver != Some(number) || !waiting {
+                    return None;
+                }
+                // Its Follow_Up then finds no Sync to follow: the line
+                // stands as the last Sync left it.
+                self.upstream = None;
+                Some(message_type)
+            }
+            _ => None,
         }
     }
 
