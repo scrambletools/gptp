@@ -22,13 +22,19 @@ files="/usr/bin/gptpd
 /usr/share/licenses/gptpd/LICENSE-MIT
 /usr/share/licenses/gptpd/LICENSE-APACHE"
 
+# Ubuntu's and Arch's images leave /usr/share/doc out of every install,
+# where a full system doesn't, so the test undoes that first.
 case $package in
 *.deb)
+    sed -i '/^path-exclude/d' /etc/dpkg/dpkg.cfg.d/* 2>/dev/null || true
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "$package"
     ;;
 *.rpm) dnf install -y -q --setopt=install_weak_deps=False "$package" ;;
-*.pkg.tar.*) pacman -Syu --noconfirm -q && pacman -U --noconfirm -q "$package" ;;
+*.pkg.tar.*)
+    sed -i '/^NoExtract/d' /etc/pacman.conf
+    pacman -Syu --noconfirm -q && pacman -U --noconfirm "$package"
+    ;;
 *) fail "no package manager for $package" ;;
 esac
 
