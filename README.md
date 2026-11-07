@@ -112,7 +112,9 @@ gptpd --bridge br0 --clock enp1s0 enp2s0 enp3s0 enp4s0 enp5s0 enp6s0
 `config/systemd/gptpd.service` runs it on a bridge. It conflicts with
 linuxptp's units and is ordered against them, so one command switches,
 and needs `CAP_NET_RAW`, `CAP_NET_ADMIN` and the ports' `/dev/ptpN`
-read-write.
+read-write. It starts as the bridge appears, not once the network is
+online, so its ports answer Pdelay as their links come up. The bridge
+must have its own MAC by then.
 
 `docs/endpoints-plan.md` is the plan for end stations, grandmaster
 capability and the AVB Lite profile.

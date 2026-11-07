@@ -1,7 +1,11 @@
 [Unit]
 Description=AVB bridge: gPTP (802.1AS) time-aware relay on the switch ports
-After=network-online.target
-Wants=network-online.target
+# Started as br0 appears, not once it has an address: an end station that
+# gets no Pdelay answer for about 9 s after its link comes up may fall back
+# to AVB Lite until its next link-up, and a DHCP lease can take longer.
+# br0 must have its own MAC as it appears, which names the relay.
+After=sys-subsystem-net-devices-br0.device
+Wants=sys-subsystem-net-devices-br0.device
 # One gPTP daemon at a time: starting this one stops linuxptp's, and
 # starting gptp-bridge stops this one. Ordered too, so the stop is done
 # before the start either way: two responders to one Pdelay_Req, even
