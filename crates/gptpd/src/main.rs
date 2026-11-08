@@ -265,7 +265,10 @@ impl Daemon {
             .as_ref()
             .is_some_and(|end| end.station.awaiting_rebase());
         for (index, port) in self.ports.iter_mut().enumerate() {
-            let carrier = read(&port.name, "carrier").as_deref() == Some("1");
+            // operstate, not carrier: reading carrier waits for RTNL, so
+            // while another program held it, a Wi-Fi driver restarting its
+            // firmware once for 3 s, no port sent a Sync or a Pdelay answer.
+            let carrier = read(&port.name, "operstate").as_deref() == Some("up");
             let member = self.bridge.as_ref().is_none_or(|bridge| {
                 Path::new("/sys/class/net")
                     .join(bridge)

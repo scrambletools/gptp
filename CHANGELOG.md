@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- gptpd reads each port's operstate, not its carrier. Reading carrier
+  waits for RTNL, and while a Wi-Fi driver restarting its firmware held
+  that for 3 s, no port sent a Sync or answered a Pdelay.
 - gptp: `Relay::handle_unstamped` and `Link::distrust_response`. A frame
   that came without a hardware time stamp, from a card that stamps every
   frame, leaves the frame before it distrusted: an I210 can give one
