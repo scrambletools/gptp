@@ -36,6 +36,16 @@ pub enum Incapable {
     NoRate,
     NoDelay,
     LongDelay,
+    /// An 802.11 port with no station to stamp frames to and from.
+    NoStation,
+    /// An 802.11 port whose station takes part in neither Timing
+    /// Measurement nor Fine Timing Measurement.
+    NoMeasurement,
+    /// An 802.11 port with only Fine Timing Measurement, whose station has
+    /// not lately said it runs gPTP (802.1AS-2020 12.4).
+    NotGptpCapable,
+    /// An 802.11 port whose neighbor refused the FTM bursts asked of it.
+    FtmRefused,
 }
 
 impl Incapable {
@@ -48,6 +58,10 @@ impl Incapable {
             Self::NoRate => "the neighbor's rate is not known yet",
             Self::NoDelay => "the link delay is not known yet",
             Self::LongDelay => "the link delay is over the threshold",
+            Self::NoStation => "no station is associated",
+            Self::NoMeasurement => "its station does neither Timing Measurement nor FTM",
+            Self::NotGptpCapable => "its station has not lately said it runs gPTP",
+            Self::FtmRefused => "its neighbor refused the FTM bursts asked for",
         }
     }
 }

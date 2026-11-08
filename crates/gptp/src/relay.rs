@@ -21,6 +21,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::time::Duration;
 
+use crate::dot11::ftm::{self, FineTimingMeasurement, FtmRequest};
+use crate::dot11::{self, Support, TimingMeasurement};
 use crate::link::{self, Link, correction_nanos, interval};
 use crate::message::{
     Announce, Body, ClockIdentity, Flags, FollowUpInformation, GptpCapable, Header, Message,
@@ -205,14 +207,32 @@ impl Stamp {
     }
 }
 
-/// A frame to send on a port, the octets after its Ethernet header, and
-/// the message whose departure the caller is to report with
+/// A frame to send on a port: the octets after its Ethernet header, or an
+/// 802.11 Action frame's Action field; where it goes; and the message
+/// whose departure the caller is to report with
 /// [`Relay::handle_transmit_time`], if it is an event message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transmit {
     pub port: u16,
     pub frame: Vec<u8>,
     pub stamp: Option<(MessageType, u16)>,
+    pub destination: Destination,
+}
+
+/// Where a frame goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Destination {
+    /// gPTP's group address, on a full-duplex link.
+    Group,
+    /// An 802.11 port's station, by its own address (802.1AS-2020 12.2).
+    Station([u8; 6]),
+    /// A Timing Measurement or FTM frame to an 802.11 port's station. When
+    /// it left and when its Ack came back go to
+    /// [`Relay::handle_measurement_confirm`] with its dialog token.
+    Measurement { station: [u8; 6], dialog_token: u8 },
+    /// Another Action frame to an 802.11 port's station, an FTM Request,
+    /// whose times are not wanted.
+    Action { station: [u8; 6] },
 }
 
 /// A change the caller may want to know of.
@@ -261,6 +281,9 @@ struct Relaying {
     sent: Option<Stamp>,
     /// A Sync of this system's own, as grandmaster.
     own: bool,
+    /// On an 802.11 port, the dialog token of the Timing Measurement frame
+    /// sent in its place.
+    token: Option<u8>,
 }
 
 /// The timereceiver port's last Sync and, once it comes, its Follow_Up.
@@ -269,6 +292,14 @@ struct Upstream {
     sequence: u16,
     received: Stamp,
     follow_up: Option<FollowedUp>,
+}
+
+/// A Follow_Up to send, but for its TLV's encoding.
+#[derive(Debug, Clone, Copy)]
+struct FollowUp {
+    header: Header,
+    precise_origin: Timestamp,
+    information: FollowUpInformation,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -283,9 +314,64 @@ struct FollowedUp {
     link_delay: f64,
 }
 
+/// An 802.11 port's side of 802.1AS-2020 clause 12, towards its one
+/// station.
+#[derive(Debug, Clone)]
+struct Wireless {
+    station: Option<[u8; 6]>,
+    support: Support,
+    transmitter: dot11::Transmitter,
+    receiver: dot11::Receiver,
+    responder: ftm::Responder,
+    initiator: ftm::Initiator,
+}
+
+impl Wireless {
+    fn new(log_sync_interval: i8) -> Self {
+        Self {
+            station: None,
+            support: Support::NONE,
+            transmitter: dot11::Transmitter::new(),
+            receiver: dot11::Receiver::new(),
+            responder: ftm::Responder::new(),
+            initiator: ftm::Initiator::new(log_sync_interval),
+        }
+    }
+
+    /// Whether the port measures with FTM: when both ends take part,
+    /// unless the neighbor refused its bursts and Timing Measurement is
+    /// there to fall back on (802.1AS-2020 Figure 12-7).
+    fn uses_ftm(&self) -> bool {
+        self.support.fine_timing_measurement
+            && !(self.support.timing_measurement && self.initiator.capable() == Some(false))
+    }
+
+    /// Why the port is not asCapable (802.1AS-2020 12.4), while it is not,
+    /// with the neighbor's word that it runs gPTP or not. Timing
+    /// Measurement on domain 0 needs no word, as with a system of the 2011
+    /// edition; FTM alone does, and bursts the neighbor grants.
+    fn incapable_because(&self, gptp_capable: bool) -> Option<link::Incapable> {
+        if self.station.is_none() {
+            Some(link::Incapable::NoStation)
+        } else if self.support.timing_measurement {
+            None
+        } else if !self.support.fine_timing_measurement {
+            Some(link::Incapable::NoMeasurement)
+        } else if !gptp_capable {
+            Some(link::Incapable::NotGptpCapable)
+        } else if self.initiator.capable() == Some(false) {
+            Some(link::Incapable::FtmRefused)
+        } else {
+            None
+        }
+    }
+}
+
 struct Port {
     number: u16,
     link: Link,
+    /// An 802.11 port's side, none on a full-duplex link.
+    wireless: Option<Wireless>,
     up: bool,
     as_capable: bool,
     role: Role,
@@ -302,6 +388,44 @@ struct Port {
     /// The last message heard on the port, for one that comes after it
     /// without a time stamp.
     last_heard: Option<(MessageType, u16)>,
+}
+
+impl Port {
+    /// The 802.11 side, while the port is up towards a station it measures
+    /// with FTM.
+    fn ftm(&self) -> Option<&Wireless> {
+        self.wireless
+            .as_ref()
+            .filter(|wireless| self.up && wireless.station.is_some() && wireless.uses_ftm())
+    }
+
+    /// Why an 802.11 port is not asCapable, while it is not. Its
+    /// neighbor's word that it runs gPTP lasts until the timeout drops it.
+    fn wireless_incapable(&self, wireless: &Wireless) -> Option<link::Incapable> {
+        wireless.incapable_because(self.capable_until.is_some())
+    }
+
+    /// Whether the port asks its neighbor for FTM bursts: as timereceiver,
+    /// and while refused, to learn when bursts are granted again.
+    fn asks_for_bursts(&self) -> bool {
+        self.ftm().is_some_and(|wireless| {
+            self.role == Role::TimeReceiver
+                || self.wireless_incapable(wireless) == Some(link::Incapable::FtmRefused)
+        })
+    }
+
+    /// When the port's FTM side is next due: the next frame of a burst it
+    /// sends as timetransmitter, or the next burst it asks for.
+    fn ftm_due(&self) -> Option<Duration> {
+        let wireless = self.ftm()?;
+        if self.role == Role::TimeTransmitter {
+            wireless.responder.poll_timeout()
+        } else if self.asks_for_bursts() {
+            wireless.initiator.poll_timeout()
+        } else {
+            None
+        }
+    }
 }
 
 /// A time-aware relay across its ports.
@@ -361,6 +485,7 @@ impl Relay {
                     },
                     config.link,
                 ),
+                wireless: None,
                 up: false,
                 as_capable: false,
                 role: Role::Disabled,
@@ -468,7 +593,7 @@ impl Relay {
             return;
         }
         port.up = up;
-        port.link.set_enabled(now, up);
+        port.link.set_enabled(now, up && port.wireless.is_none());
         port.next_capable = (up && sends_capable).then_some(now);
         if !up {
             port.information = None;
@@ -497,6 +622,20 @@ impl Relay {
             return;
         };
         if !self.ports[index].up {
+            return;
+        }
+        // An 802.11 port measures its link, and carries the Sync's time,
+        // with Timing Measurement frames (802.1AS-2020 12.1).
+        if self.ports[index].wireless.is_some()
+            && matches!(
+                message.message_type(),
+                MessageType::PdelayReq
+                    | MessageType::PdelayResp
+                    | MessageType::PdelayRespFollowUp
+                    | MessageType::Sync
+                    | MessageType::FollowUp
+            )
+        {
             return;
         }
         self.ports[index].last_heard = Some((message.message_type(), message.header.sequence_id));
@@ -528,6 +667,7 @@ impl Relay {
                     let lasts = interval(capable.log_interval)
                         * u32::from(self.config.gptp_capable_receipt_timeout);
                     self.ports[index].capable_until = Some(now + lasts);
+                    self.check_capable(now, number);
                 }
             }
             // 1588's end-to-end exchange, which gPTP does not use.
@@ -601,6 +741,203 @@ impl Relay {
         }
     }
 
+    /// Makes port `number` an 802.11 port (802.1AS-2020 clause 12) towards
+    /// `station`, the one station whose frames the radio stamps, or none;
+    /// `support` says which ways to measure it the station and the port
+    /// both take part in. A new station starts the port's measurements
+    /// afresh.
+    pub fn set_wireless(
+        &mut self,
+        now: Duration,
+        number: u16,
+        station: Option<[u8; 6]>,
+        support: Support,
+    ) {
+        let log_sync_interval = self.config.log_sync_interval;
+        let Some(port) = self.port_mut(number) else {
+            return;
+        };
+        let changed = port
+            .wireless
+            .as_ref()
+            .is_none_or(|wireless| wireless.station != station);
+        let wireless = port
+            .wireless
+            .get_or_insert_with(|| Wireless::new(log_sync_interval));
+        if changed {
+            *wireless = Wireless::new(log_sync_interval);
+            port.information = None;
+            port.relaying = None;
+            port.capable_until = None;
+        }
+        wireless.station = station;
+        wireless.support = support;
+        port.link.set_enabled(now, false);
+        self.check_capable(now, number);
+        self.select(now);
+    }
+
+    /// An FTM Request heard on 802.11 port `number` from its station, its
+    /// Action field: on a timetransmitter port that measures with FTM, it
+    /// starts a burst (802.1AS-2020 master state machine B).
+    pub fn handle_ftm_request(&mut self, now: Duration, number: u16, frame: &[u8]) {
+        let Ok(request) = FtmRequest::decode(frame) else {
+            return;
+        };
+        let Some(index) = self.index(number) else {
+            return;
+        };
+        let port = &mut self.ports[index];
+        if port.role != Role::TimeTransmitter || port.ftm().is_none() {
+            return;
+        }
+        let Some(wireless) = port.wireless.as_mut() else {
+            return;
+        };
+        let Some(station) = wireless.station else {
+            return;
+        };
+        if let Some(frame) = wireless.responder.request(now, &request) {
+            self.outgoing
+                .push_back(fine_timing_measurement(number, station, &frame));
+        }
+    }
+
+    /// When the Timing Measurement or FTM frame `dialog_token` left 802.11
+    /// port `number` and when its Ack came back, as the radio stamped them:
+    /// the departure on its clock and the LocalClock, the Ack's arrival on
+    /// its clock. A frame whose Ack never came is not reported.
+    pub fn handle_measurement_confirm(
+        &mut self,
+        number: u16,
+        dialog_token: u8,
+        departure: Stamp,
+        ack_arrival: i128,
+    ) {
+        let Some(index) = self.index(number) else {
+            return;
+        };
+        let port = &mut self.ports[index];
+        let Some(wireless) = port.wireless.as_mut() else {
+            return;
+        };
+        if wireless.uses_ftm() {
+            wireless
+                .responder
+                .confirmed(dialog_token, departure.port, ack_arrival);
+            self.follow_up_ftm(index, dialog_token, departure);
+            return;
+        }
+        wireless
+            .transmitter
+            .confirmed(dialog_token, departure.port, ack_arrival);
+        if let Some(relaying) = port
+            .relaying
+            .as_mut()
+            .filter(|relaying| relaying.token == Some(dialog_token))
+        {
+            relaying.sent = Some(departure);
+        }
+        self.send_follow_up(index);
+    }
+
+    /// A Timing Measurement or FTM frame heard on 802.11 port `number`, its
+    /// Action field: when it arrived, on the radio's clock and the
+    /// LocalClock, and when its Ack left, on the radio's clock. A Timing
+    /// Measurement frame that follows up one heard, or the end of an FTM
+    /// burst asked for, brings the grandmaster's time as a Sync and its
+    /// Follow_Up would, and the link as Pdelay measures it.
+    pub fn handle_measurement(
+        &mut self,
+        now: Duration,
+        number: u16,
+        frame: &[u8],
+        arrival: Stamp,
+        ack_departure: i128,
+    ) {
+        let Some(index) = self.index(number) else {
+            return;
+        };
+        let port = &mut self.ports[index];
+        let asks = port.asks_for_bursts();
+        if !port.up {
+            return;
+        }
+        let Some(wireless) = port.wireless.as_mut() else {
+            return;
+        };
+        let measurement = if let Ok(frame) = TimingMeasurement::decode(frame) {
+            wireless.receiver.indication(&frame, arrival, ack_departure)
+        } else if let Ok(frame) = FineTimingMeasurement::decode(frame)
+            && asks
+        {
+            let granted = wireless.initiator.capable();
+            let measurement = wireless
+                .initiator
+                .frame(now, &frame, arrival, ack_departure);
+            if wireless.initiator.capable() != granted {
+                self.check_capable(now, number);
+            }
+            measurement
+        } else {
+            return;
+        };
+        if let Some(measurement) = measurement {
+            self.follow_measurement(now, index, &measurement);
+        }
+    }
+
+    /// The grandmaster's time an 802.11 port's measurement brings, on the
+    /// timereceiver port, taken as a Sync and its Follow_Up.
+    fn follow_measurement(
+        &mut self,
+        now: Duration,
+        index: usize,
+        measurement: &dot11::Measurement,
+    ) {
+        let port = &self.ports[index];
+        let Some(message) = measurement.follow_up_message() else {
+            return;
+        };
+        let Body::FollowUp { precise_origin } = message.body else {
+            return;
+        };
+        if self.receiver != Some(port.number)
+            || !port.as_capable
+            || port
+                .information
+                .as_ref()
+                .is_none_or(|information| information.vector.source != message.header.source)
+        {
+            return;
+        }
+        self.sync_expires = Some(
+            now + interval(message.header.log_interval)
+                * u32::from(self.config.sync_receipt_timeout),
+        );
+        let information = message.follow_up_information().unwrap_or_default();
+        let upstream_rate = 1.0 + f64::from(information.cumulative_scaled_rate_offset) / RATE_SCALE;
+        // As for a Follow_Up on a full-duplex link: the link measured on the
+        // port's clock, the neighbor's rate over it and the delay in its
+        // time.
+        let port_rate = measurement.arrival.rate;
+        let followed = FollowedUp {
+            precise_origin,
+            correction: message.header.correction,
+            information,
+            rate_ratio: upstream_rate * measurement.neighbor_rate_ratio * port_rate,
+            link_delay: measurement.mean_link_delay / port_rate,
+        };
+        let sequence = message.header.sequence_id;
+        self.upstream = Some(Upstream {
+            sequence,
+            received: measurement.arrival,
+            follow_up: Some(followed),
+        });
+        self.synced = Some((measurement.arrival.local, followed));
+        self.relay_sync(sequence);
+    }
+
     /// When [`handle_timeout`](Self::handle_timeout) is next due.
     pub fn poll_timeout(&self) -> Option<Duration> {
         self.ports
@@ -613,6 +950,10 @@ impl Relay {
                     port.information
                         .as_ref()
                         .map(|information| information.expires),
+                    port.ftm_due(),
+                    // An FTM port's asCapable may end with the neighbor's
+                    // word that it runs gPTP.
+                    port.capable_until.filter(|_| port.wireless.is_some()),
                 ]
             })
             .chain([self.sync_expires, self.next_sync, self.listening_due()])
@@ -631,6 +972,12 @@ impl Relay {
             let number = self.ports[index].number;
             if let Some(transmit) = self.ports[index].link.handle_timeout(now) {
                 self.queue(number, &transmit.message, transmit.stamp);
+            }
+            if self.ports[index]
+                .capable_until
+                .is_some_and(|until| until <= now)
+            {
+                self.ports[index].capable_until = None;
             }
             reselect |= self.check_capable(now, number);
             let port = &mut self.ports[index];
@@ -672,6 +1019,9 @@ impl Relay {
                 self.send_capable(now, index);
             }
         }
+        for index in 0..self.ports.len() {
+            self.poll_ftm(now, index);
+        }
         if let Some(due) = self.next_sync.filter(|due| *due <= now) {
             let interval = interval(self.config.log_sync_interval);
             // Behind by more than an interval, as after a stall: from now.
@@ -681,6 +1031,37 @@ impl Relay {
                 now + interval
             });
             self.send_own_syncs();
+        }
+    }
+
+    /// An 802.11 port's FTM frame or request, if one is due: the next frame
+    /// of a burst it sends as timetransmitter, or the next burst it asks
+    /// for.
+    fn poll_ftm(&mut self, now: Duration, index: usize) {
+        let port = &mut self.ports[index];
+        let (number, role) = (port.number, port.role);
+        let asks = port.asks_for_bursts();
+        if port.ftm().is_none() {
+            return;
+        }
+        let Some(wireless) = port.wireless.as_mut() else {
+            return;
+        };
+        let Some(station) = wireless.station else {
+            return;
+        };
+        if role == Role::TimeTransmitter {
+            if let Some(frame) = wireless.responder.poll_frame(now) {
+                self.outgoing
+                    .push_back(fine_timing_measurement(number, station, &frame));
+            }
+        } else if asks && let Some(request) = wireless.initiator.poll_request(now) {
+            self.outgoing.push_back(Transmit {
+                port: number,
+                frame: request.encode(),
+                stamp: None,
+                destination: Destination::Action { station },
+            });
         }
     }
 
@@ -730,34 +1111,75 @@ impl Relay {
     /// This system's Sync, as grandmaster, on every timetransmitter port.
     fn send_own_syncs(&mut self) {
         for index in 0..self.ports.len() {
-            let port = &mut self.ports[index];
-            if port.role != Role::TimeTransmitter {
-                continue;
+            if self.ports[index].role == Role::TimeTransmitter {
+                self.send_sync(index, 0, true);
             }
-            port.sync_sequence = port.sync_sequence.wrapping_add(1);
-            let sequence = port.sync_sequence;
+        }
+    }
+
+    /// The grandmaster's Sync `upstream` relayed on every timetransmitter
+    /// port.
+    fn relay_sync(&mut self, upstream: u16) {
+        for index in 0..self.ports.len() {
+            if self.ports[index].role == Role::TimeTransmitter {
+                self.send_sync(index, upstream, false);
+            }
+        }
+    }
+
+    /// A Sync on the port, or on an 802.11 port a Timing Measurement frame
+    /// in its place, whose departure its Follow_Up waits for. With FTM the
+    /// station's requests pace the frames instead, each followed up with
+    /// the time as it stands when it leaves.
+    fn send_sync(&mut self, index: usize, upstream: u16, own: bool) {
+        let port = &mut self.ports[index];
+        port.sync_sequence = port.sync_sequence.wrapping_add(1);
+        let (number, sequence) = (port.number, port.sync_sequence);
+        if let Some(wireless) = port.wireless.as_mut() {
+            let Some(station) = wireless.station.filter(|_| !wireless.uses_ftm()) else {
+                port.relaying = None;
+                return;
+            };
+            let frame = wireless.transmitter.next_frame();
             port.relaying = Some(Relaying {
                 sequence,
-                upstream: 0,
+                upstream,
                 sent: None,
-                own: true,
+                own,
+                token: Some(frame.dialog_token),
             });
-            let number = port.number;
-            let sync = Message {
-                header: self.header(
-                    number,
-                    sequence,
-                    Flags::TWO_STEP | Flags::PTP_TIMESCALE,
-                    SYNC_CONTROL,
-                    self.config.log_sync_interval,
-                ),
-                body: Body::Sync {
-                    origin: Timestamp::default(),
+            self.outgoing.push_back(Transmit {
+                port: number,
+                frame: frame.encode(),
+                stamp: None,
+                destination: Destination::Measurement {
+                    station,
+                    dialog_token: frame.dialog_token,
                 },
-                tlvs: &[],
-            };
-            self.queue(number, &sync, true);
+            });
+            return;
         }
+        port.relaying = Some(Relaying {
+            sequence,
+            upstream,
+            sent: None,
+            own,
+            token: None,
+        });
+        let sync = Message {
+            header: self.header(
+                number,
+                sequence,
+                Flags::TWO_STEP | Flags::PTP_TIMESCALE,
+                SYNC_CONTROL,
+                self.config.log_sync_interval,
+            ),
+            body: Body::Sync {
+                origin: Timestamp::default(),
+            },
+            tlvs: &[],
+        };
+        self.queue(number, &sync, true);
     }
 
     pub fn poll_transmit(&mut self) -> Option<Transmit> {
@@ -906,35 +1328,7 @@ impl Relay {
             received,
             follow_up: None,
         });
-        for index in 0..self.ports.len() {
-            let port = &mut self.ports[index];
-            if port.role != Role::TimeTransmitter {
-                continue;
-            }
-            port.sync_sequence = port.sync_sequence.wrapping_add(1);
-            let sequence = port.sync_sequence;
-            port.relaying = Some(Relaying {
-                sequence,
-                upstream,
-                sent: None,
-                own: false,
-            });
-            let number = port.number;
-            let sync = Message {
-                header: self.header(
-                    number,
-                    sequence,
-                    Flags::TWO_STEP | Flags::PTP_TIMESCALE,
-                    SYNC_CONTROL,
-                    self.config.log_sync_interval,
-                ),
-                body: Body::Sync {
-                    origin: Timestamp::default(),
-                },
-                tlvs: &[],
-            };
-            self.queue(number, &sync, true);
-        }
+        self.relay_sync(upstream);
     }
 
     fn receive_follow_up(&mut self, index: usize, message: &Message) {
@@ -1004,44 +1398,14 @@ impl Relay {
         }
         port.relaying = None;
         let number = port.number;
-        // 802.1AS-2020 11.2.15.2.1: the correction grows by the time since
-        // the upstream system sent the Sync, the link delay and the
-        // residence here, on the grandmaster's time base.
-        let elapsed = (sent.local - upstream.received.local) as f64 + followed.link_delay;
-        let added = elapsed * followed.rate_ratio * CORRECTION_SCALE;
-        let correction = followed.correction.saturating_add(added as i64);
-        // The neighbor measures this port's clock, so the rate ratio it
-        // takes on is the grandmaster's over that clock.
-        let information = FollowUpInformation {
-            cumulative_scaled_rate_offset: ((followed.rate_ratio / sent.rate - 1.0) * RATE_SCALE)
-                as i32,
-            ..followed.information
-        };
-        let mut tlv = [0; 32];
-        let Ok(length) = Tlv::FollowUpInformation(information).encode(&mut tlv) else {
-            return;
-        };
-        let mut header = self.header(
-            number,
-            relaying.sequence,
-            Flags::PTP_TIMESCALE,
-            FOLLOW_UP_CONTROL,
-            self.config.log_sync_interval,
-        );
-        header.correction = correction;
-        let follow_up = Message {
-            header,
-            body: Body::FollowUp {
-                precise_origin: followed.precise_origin,
-            },
-            tlvs: &tlv[..length],
-        };
-        self.queue(number, &follow_up, false);
+        let from = Some((upstream.received.local, followed));
+        if let Some(follow_up) = self.follow_up(number, relaying.sequence, sent, from) {
+            self.emit_follow_up(index, relaying.token, follow_up);
+        }
     }
 
     /// The Follow_Up of this system's own Sync on the port, once the time
-    /// it left is known: this system's time then, and its rate over the
-    /// port's clock, which the neighbor measures.
+    /// it left is known.
     fn send_own_follow_up(&mut self, index: usize) {
         let port = &mut self.ports[index];
         let Some(relaying) = port.relaying else {
@@ -1052,34 +1416,118 @@ impl Relay {
         };
         port.relaying = None;
         let number = port.number;
-        let Some(origin) = Timestamp::from_nanos(self.time_base.at(sent.local)) else {
+        if let Some(follow_up) = self.follow_up(number, relaying.sequence, sent, None) {
+            self.emit_follow_up(index, relaying.token, follow_up);
+        }
+    }
+
+    /// The Follow_Up of FTM frame `token`, which left the port at `sent`,
+    /// with the time as this system last had it: its own as grandmaster,
+    /// or the last Sync's from the grandmaster with its Follow_Up
+    /// (802.1AS-2020 12.5.1.4.6). It goes out in the burst's next frame.
+    fn follow_up_ftm(&mut self, index: usize, token: u8, sent: Stamp) {
+        if token == 0 || self.ports[index].role != Role::TimeTransmitter {
             return;
+        }
+        let from = match self.synced {
+            _ if self.is_grandmaster() => None,
+            Some(synced) => Some(synced),
+            None => return,
         };
+        let port = &mut self.ports[index];
+        port.sync_sequence = port.sync_sequence.wrapping_add(1);
+        let (number, sequence) = (port.number, port.sync_sequence);
+        if let Some(follow_up) = self.follow_up(number, sequence, sent, from) {
+            self.emit_follow_up(index, Some(token), follow_up);
+        }
+    }
+
+    /// What the Follow_Up says of a Sync, or a frame in its place, that
+    /// left port `number` at `sent`: relaying the grandmaster's Sync that
+    /// arrived at `from` with its Follow_Up, or with none this system's
+    /// own time as grandmaster.
+    fn follow_up(
+        &self,
+        number: u16,
+        sequence: u16,
+        sent: Stamp,
+        from: Option<(i128, FollowedUp)>,
+    ) -> Option<FollowUp> {
+        let mut header = self.header(
+            number,
+            sequence,
+            Flags::PTP_TIMESCALE,
+            FOLLOW_UP_CONTROL,
+            self.config.log_sync_interval,
+        );
+        let Some((received, followed)) = from else {
+            // This system's time then, and its rate over the port's clock,
+            // which the neighbor measures.
+            let information = FollowUpInformation {
+                cumulative_scaled_rate_offset: ((self.time_base.rate / sent.rate - 1.0)
+                    * RATE_SCALE) as i32,
+                gm_time_base_indicator: self.time_base_indicator,
+                last_gm_phase_change: self.last_phase_change,
+                scaled_last_gm_freq_change: self.last_frequency_change,
+            };
+            return Some(FollowUp {
+                header,
+                precise_origin: Timestamp::from_nanos(self.time_base.at(sent.local))?,
+                information,
+            });
+        };
+        // 802.1AS-2020 11.2.15.2.1: the correction grows by the time since
+        // the upstream system sent the Sync, the link delay and the
+        // residence here, on the grandmaster's time base.
+        let elapsed = (sent.local - received) as f64 + followed.link_delay;
+        let added = elapsed * followed.rate_ratio * CORRECTION_SCALE;
+        header.correction = followed.correction.saturating_add(added as i64);
+        // The neighbor measures this port's clock, so the rate ratio it
+        // takes on is the grandmaster's over that clock.
         let information = FollowUpInformation {
-            cumulative_scaled_rate_offset: ((self.time_base.rate / sent.rate - 1.0) * RATE_SCALE)
+            cumulative_scaled_rate_offset: ((followed.rate_ratio / sent.rate - 1.0) * RATE_SCALE)
                 as i32,
-            gm_time_base_indicator: self.time_base_indicator,
-            last_gm_phase_change: self.last_phase_change,
-            scaled_last_gm_freq_change: self.last_frequency_change,
+            ..followed.information
         };
+        Some(FollowUp {
+            header,
+            precise_origin: followed.precise_origin,
+            information,
+        })
+    }
+
+    /// Sends a Follow_Up on the port, or on an 802.11 port has it go out in
+    /// the next Timing Measurement or FTM frame, which follows up the one
+    /// `token` names.
+    fn emit_follow_up(&mut self, index: usize, token: Option<u8>, follow_up: FollowUp) {
         let mut tlv = [0; 32];
-        let Ok(length) = Tlv::FollowUpInformation(information).encode(&mut tlv) else {
+        let Ok(length) = Tlv::FollowUpInformation(follow_up.information).encode(&mut tlv) else {
             return;
         };
-        let follow_up = Message {
-            header: self.header(
-                number,
-                relaying.sequence,
-                Flags::PTP_TIMESCALE,
-                FOLLOW_UP_CONTROL,
-                self.config.log_sync_interval,
-            ),
+        let message = Message {
+            header: follow_up.header,
             body: Body::FollowUp {
-                precise_origin: origin,
+                precise_origin: follow_up.precise_origin,
             },
             tlvs: &tlv[..length],
         };
-        self.queue(number, &follow_up, false);
+        let number = self.ports[index].number;
+        let Some(wireless) = self.ports[index].wireless.as_mut() else {
+            self.queue(number, &message, false);
+            return;
+        };
+        let mut octets = [0; dot11::FOLLOW_UP_LENGTH];
+        let Some(token) = token else {
+            return;
+        };
+        if message.encode(&mut octets) != Ok(dot11::FOLLOW_UP_LENGTH) {
+            return;
+        }
+        if wireless.uses_ftm() {
+            wireless.responder.set_follow_up(token, &octets);
+        } else {
+            wireless.transmitter.set_follow_up(token, &octets);
+        }
     }
 
     fn send_announce(&mut self, now: Duration, index: usize) {
@@ -1163,7 +1611,11 @@ impl Relay {
             return false;
         };
         let port = &mut self.ports[index];
-        let as_capable = port.up && port.link.as_capable();
+        let as_capable = port.up
+            && match &port.wireless {
+                Some(wireless) => port.wireless_incapable(wireless).is_none(),
+                None => port.link.as_capable(),
+            };
         if as_capable == port.as_capable {
             return false;
         }
@@ -1301,7 +1753,17 @@ impl Relay {
         }
     }
 
+    /// A message on the port: to gPTP's group address, or on an 802.11
+    /// port to its station, if it has one.
     fn queue(&mut self, number: u16, message: &Message, stamp: bool) {
+        let destination = match self.index(number).map(|index| &self.ports[index].wireless) {
+            Some(None) => Destination::Group,
+            Some(Some(Wireless {
+                station: Some(station),
+                ..
+            })) => Destination::Station(*station),
+            _ => return,
+        };
         let mut frame = vec![0; message.encoded_len()];
         if message.encode(&mut frame).is_err() {
             return;
@@ -1310,6 +1772,7 @@ impl Relay {
             port: number,
             frame,
             stamp: stamp.then_some((message.message_type(), message.header.sequence_id)),
+            destination,
         });
     }
 
@@ -1319,7 +1782,10 @@ impl Relay {
         if !port.up {
             return Some(link::Incapable::Down);
         }
-        port.link.incapable_because()
+        match &port.wireless {
+            Some(wireless) => port.wireless_incapable(wireless),
+            None => port.link.incapable_because(),
+        }
     }
 
     fn index(&self, number: u16) -> Option<usize> {
@@ -1328,6 +1794,23 @@ impl Relay {
 
     fn port_mut(&mut self, number: u16) -> Option<&mut Port> {
         self.ports.iter_mut().find(|port| port.number == number)
+    }
+}
+
+/// An FTM frame to send on port `number` to `station`.
+fn fine_timing_measurement(
+    number: u16,
+    station: [u8; 6],
+    frame: &FineTimingMeasurement,
+) -> Transmit {
+    Transmit {
+        port: number,
+        frame: frame.encode(),
+        stamp: None,
+        destination: Destination::Measurement {
+            station,
+            dialog_token: frame.dialog_token,
+        },
     }
 }
 

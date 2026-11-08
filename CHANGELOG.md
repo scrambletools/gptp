@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- gptp: `dot11`, gPTP over 802.11 links (802.1AS-2020 clause 12):
+  Timing Measurement and Fine Timing Measurement frames carrying the
+  Follow_Up element of 12.7, both ends of each exchange, and
+  `Relay::set_wireless`, which makes a port an 802.11 port towards one
+  station.
+- raw-ether: `wifi`, 802.11 Action frames through nl80211 on Linux with
+  the radio's times; a hardware clock is read with
+  PTP_SYS_OFFSET_PRECISE where its driver has nothing finer, as
+  iwlwifi's.
+- gptpd: Wi-Fi ports, their station taken from hostapd or
+  wpa_supplicant, and `--wifi-support`. Not yet run against a station.
 - gptpd reads each port's operstate, not its carrier. Reading carrier
   waits for RTNL, and while a Wi-Fi driver restarting its firmware held
   that for 3 s, no port sent a Sync or answered a Pdelay.

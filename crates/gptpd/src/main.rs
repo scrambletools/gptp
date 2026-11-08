@@ -13,14 +13,16 @@ mod lite;
 mod server;
 mod station;
 mod status;
+mod wifi;
 
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use gptp::dot11::Support;
 use gptp::link::Incapable;
-use gptp::relay::{Config, Event, Relay, Stamp, SystemIdentity, TimeBase};
+use gptp::relay::{Config, Destination, Event, Relay, Stamp, SystemIdentity, TimeBase};
 use gptp::{ClockIdentity, DESTINATION, ETHERTYPE_GPTP, MessageType};
 use raw_ether::MacAddress;
 use raw_ether::interfaces::LinkChanges;
@@ -30,6 +32,7 @@ use crate::clocks::Clocks;
 use crate::lite::Lite;
 use crate::server::Server;
 use crate::station::{Found, Station, Steadying, View};
+use crate::wifi::{Heard, WifiPort};
 
 /// How often the ports' clocks are compared with the LocalClock.
 const COMPARE_EVERY: Duration = Duration::from_millis(100);
@@ -111,6 +114,9 @@ usage: gptpd [options] INTERFACE...
   --check INTERFACE   exit 0 if no other PTP daemon runs on INTERFACE, or
                       else 3, saying why in /run/gptpd/INTERFACE.refused;
                       an end station checks so as it starts
+  --wifi-support WAYS take a Wi-Fi port's station to measure with WAYS,
+                      tm, ftm or both, whatever its capabilities say, as
+                      hostapd's own beacon says neither
   --version           print gptpd's version
   --help              print this";
 
@@ -121,6 +127,7 @@ struct Options {
     config: Option<PathBuf>,
     status: Option<PathBuf>,
     check: Option<String>,
+    wifi_support: Option<Support>,
 }
 
 impl Options {
@@ -139,6 +146,7 @@ fn options() -> Result<Option<Options>, String> {
         config: None,
         status: None,
         check: None,
+        wifi_support: None,
     };
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -163,6 +171,12 @@ fn options() -> Result<Option<Options>, String> {
             "--config" => options.config = Some(PathBuf::from(value)),
             "--status" => options.status = Some(PathBuf::from(value)),
             "--check" => options.check = Some(value),
+            "--wifi-support" => {
+                options.wifi_support = Some(
+                    wifi::parse_support(&value)
+                        .ok_or_else(|| format!("--wifi-support {value}: tm, ftm or both"))?,
+                );
+            }
             _ => return Err(format!("unknown option {argument}")),
         }
     }
@@ -197,6 +211,8 @@ struct Port {
     stamps_every_frame: bool,
     /// Times left out, the frame after them having come without one.
     distrusted: u64,
+    /// An 802.11 port's radio, whose Action frames carry the timing.
+    wifi: Option<WifiPort>,
 }
 
 /// What an end station has beyond a relay of one port.
@@ -325,7 +341,68 @@ impl Daemon {
             self.decide_profile();
             self.flush();
         }
+        for index in 0..self.ports.len() {
+            self.hear_radio(index);
+        }
         Ok(())
+    }
+
+    /// Hands the relay what port `index`'s radio said, if it has one.
+    fn hear_radio(&mut self, index: usize) {
+        let Some(wifi) = self.ports[index].wifi.as_mut() else {
+            return;
+        };
+        for heard in wifi.take() {
+            self.hear(index, heard);
+        }
+        self.flush();
+    }
+
+    /// Hands the relay one thing port `index`'s radio said, its times put
+    /// on the LocalClock.
+    fn hear(&mut self, index: usize, heard: Heard) {
+        let now = self.now();
+        let stamp = |time: i128| {
+            self.clocks.stamp(
+                index,
+                Duration::from_nanos(u64::try_from(time).unwrap_or(0)),
+            )
+        };
+        match heard {
+            Heard::Peer(peer) => {
+                let support = peer.map_or(Support::NONE, |(_, support)| support);
+                self.relay.set_wireless(
+                    now,
+                    number(index),
+                    peer.map(|(station, _)| station.0),
+                    support,
+                );
+                self.changed = true;
+            }
+            Heard::FtmRequest(action) => self.relay.handle_ftm_request(now, number(index), &action),
+            Heard::Measurement {
+                action,
+                arrival,
+                ack_departure,
+            } => {
+                let (arrival, ack_departure) = (stamp(arrival), stamp(ack_departure).port);
+                self.relay
+                    .handle_measurement(now, number(index), &action, arrival, ack_departure);
+            }
+            Heard::Confirm {
+                dialog_token,
+                departure,
+                ack_arrival,
+            } => {
+                let (departure, ack_arrival) = (stamp(departure), stamp(ack_arrival).port);
+                self.relay.handle_measurement_confirm(
+                    number(index),
+                    dialog_token,
+                    departure,
+                    ack_arrival,
+                );
+            }
+        }
     }
 
     /// Hands the relay each frame waiting on port `index`.
@@ -405,12 +482,25 @@ impl Daemon {
                     let (index, message_type, sequence) = waiting.remove(position);
                     self.collect(index, message_type, sequence);
                 }
+                let destination = match transmit.destination {
+                    Destination::Group => MacAddress(DESTINATION),
+                    Destination::Station(station) => MacAddress(station),
+                    // Action frames go through the port's radio.
+                    Destination::Measurement { .. } | Destination::Action { .. } => {
+                        let port = &mut self.ports[index];
+                        if let Some(wifi) = port.wifi.as_mut()
+                            && let Err(error) = wifi.send(transmit.destination, &transmit.frame)
+                        {
+                            eprintln!("{}: sending an Action frame: {error}", port.name);
+                        }
+                        continue;
+                    }
+                };
                 let port = &self.ports[index];
                 let sent = if transmit.stamp.is_some() {
-                    port.socket
-                        .send_stamped(MacAddress(DESTINATION), &transmit.frame)
+                    port.socket.send_stamped(destination, &transmit.frame)
                 } else {
-                    port.socket.send(MacAddress(DESTINATION), &transmit.frame)
+                    port.socket.send(destination, &transmit.frame)
                 };
                 match sent {
                     Ok(()) => {
@@ -855,10 +945,13 @@ fn read(interface: &str, attribute: &str) -> Option<String> {
 }
 
 /// The port's gPTP socket; an end station's hears the AVB Lite profile's
-/// destination too.
-fn open(name: &str, end_station: bool) -> Result<StampedSocket, String> {
+/// destination too. An 802.11 port's carries only general messages, its
+/// timing going in Action frames, so it stamps none.
+fn open(name: &str, end_station: bool, wireless: bool) -> Result<StampedSocket, String> {
     let fail = |error: std::io::Error| format!("{name}: {error}");
-    stamped::enable(name).map_err(fail)?;
+    if !wireless {
+        stamped::enable(name).map_err(fail)?;
+    }
     let socket = StampedSocket::open(name, ETHERTYPE_GPTP).map_err(fail)?;
     socket
         .join_multicast(MacAddress(DESTINATION))
@@ -905,16 +998,25 @@ fn run(options: Options) -> Result<(), String> {
     let local = options.clock.as_ref().unwrap_or(&options.ports[0]);
     let mut clocks = Clocks::open(&options.ports, local)?;
     clocks.compare();
+    let interfaces = raw_ether::interfaces();
     let mut ports = Vec::new();
     for name in &options.ports {
+        let wireless = interfaces
+            .iter()
+            .any(|interface| interface.name == *name && interface.wireless);
         ports.push(Port {
             name: name.clone(),
-            socket: open(name, options.station().is_some())?,
+            socket: open(name, options.station().is_some(), wireless)?,
             up: false,
             missed: 0,
             outliers: 0,
             stamps_every_frame: false,
             distrusted: 0,
+            wifi: if wireless {
+                Some(WifiPort::open(name, options.wifi_support)?)
+            } else {
+                None
+            },
         });
     }
     let end_station = match options.station() {
@@ -1011,6 +1113,30 @@ fn run(options: Options) -> Result<(), String> {
         utc_offset: utc,
         gone: Vec::new(),
     };
+    // An 802.11 port measures no link with Pdelay: its station, once one
+    // is there, with Action frames.
+    for index in 0..daemon.ports.len() {
+        let port = &mut daemon.ports[index];
+        let Some(wifi) = port.wifi.as_mut() else {
+            continue;
+        };
+        eprintln!(
+            "{}: an 802.11 port, as {}",
+            port.name,
+            if wifi.access_point() {
+                "access point"
+            } else {
+                "station"
+            }
+        );
+        let chosen = wifi.choose();
+        daemon
+            .relay
+            .set_wireless(Duration::ZERO, number(index), None, Support::NONE);
+        if let Some(heard) = chosen {
+            daemon.hear(index, heard);
+        }
+    }
     let links = LinkChanges::open()
         .inspect_err(|error| {
             eprintln!("links are read every {SCAN_EVERY:?} only: netlink: {error}")
@@ -1077,11 +1203,28 @@ fn run(options: Options) -> Result<(), String> {
         .unwrap_or(next_compare);
         let sockets: Vec<&StampedSocket> = daemon.ports.iter().map(|port| &port.socket).collect();
         let timeout = Some(due.saturating_sub(daemon.now()));
-        let (ready, linked) = match &links {
-            Some(links) => stamped::wait_any_or(&sockets, links.as_fd(), timeout),
-            None => stamped::wait_any(&sockets, timeout).map(|ready| (ready, false)),
-        }
-        .map_err(|error| format!("waiting for gPTP frames: {error}"))?;
+        // Besides the sockets, the link changes and then each radio.
+        let radios: Vec<usize> = (0..daemon.ports.len())
+            .filter(|index| daemon.ports[*index].wifi.is_some())
+            .collect();
+        let others: Vec<BorrowedFd<'_>> = links
+            .iter()
+            .map(|links| links.as_fd())
+            .chain(
+                daemon
+                    .ports
+                    .iter()
+                    .filter_map(|port| port.wifi.as_ref().map(|wifi| wifi.as_fd())),
+            )
+            .collect();
+        let (ready, others_ready) = stamped::wait_any_with(&sockets, &others, timeout)
+            .map_err(|error| format!("waiting for gPTP frames: {error}"))?;
+        let linked = links.is_some() && others_ready.contains(&0);
+        let radios_ready: Vec<usize> = others_ready
+            .iter()
+            .filter_map(|position| radios.get(position.checked_sub(usize::from(links.is_some()))?))
+            .copied()
+            .collect();
         // A link that went is taken down before its frames, or a Sync
         // timeout, are made anything of; one that came is read as soon,
         // once the start has settled.
@@ -1098,6 +1241,9 @@ fn run(options: Options) -> Result<(), String> {
             daemon.flush();
             daemon.decide_profile();
             daemon.flush();
+        }
+        for index in radios_ready {
+            daemon.hear_radio(index);
         }
     }
 }

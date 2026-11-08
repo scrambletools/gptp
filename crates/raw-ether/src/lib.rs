@@ -1,8 +1,9 @@
 //! Raw Ethernet on Linux, macOS and Windows: MAC addresses, the
 //! computer's interfaces, frames of one ethertype, frames with the times
 //! the hardware stamped on them, PTP hardware clocks, and capturing whole
-//! frames. It moves frames and reads clocks, and parses no payload: gPTP,
-//! MRP and AVTP are other crates' business.
+//! frames; on Linux, also 802.11 Action frames with the radio's times.
+//! It moves frames and reads clocks, and parses no payload: gPTP, MRP
+//! and AVTP are other crates' business.
 //!
 //! Without the `std` feature only the address types remain, so protocol
 //! crates built on them also run on microcontrollers.
@@ -30,6 +31,9 @@ pub mod capture;
 
 #[cfg(feature = "std")]
 pub mod stamped;
+
+#[cfg(all(feature = "std", target_os = "linux"))]
+pub mod wifi;
 
 #[cfg(feature = "std")]
 pub use interfaces::{Interface, LinkPower, interfaces};

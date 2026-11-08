@@ -6,6 +6,12 @@ const SECOND: i128 = 1_000_000_000;
 const LOCAL_BASE: i128 = 1_000 * SECOND;
 /// How long the relay's frames take from being queued to leaving.
 const TRANSMIT_LATENCY: i128 = 20_000;
+/// An 802.11 link: a frame's time over the air, and a station's
+/// turnaround before its Ack (SIFS).
+const AIR: i128 = 50;
+const SIFS: i128 = 16_000;
+const STATION: [u8; 6] = [0x8c, 0x1f, 0x64, 0x36, 0xc1, 0x50];
+const ACCESS_POINT: [u8; 6] = [0x28, 0x0c, 0x50, 0x6b, 0x33, 0x70];
 
 fn ours() -> ClockIdentity {
     ClockIdentity(0x8c1f_64ff_fe36_c102)
@@ -102,11 +108,20 @@ struct Sent {
     port: u16,
     frame: Vec<u8>,
     left: Option<i128>,
+    destination: Destination,
 }
 
 impl Sent {
     fn message(&self) -> Message<'_> {
         Message::decode(&self.frame).expect("the relay sends what decodes")
+    }
+
+    /// A gPTP message, not an 802.11 Action frame.
+    fn is_gptp(&self) -> bool {
+        !matches!(
+            self.destination,
+            Destination::Measurement { .. } | Destination::Action { .. }
+        )
     }
 }
 
@@ -119,6 +134,8 @@ struct Bench {
     now: Duration,
     sent: Vec<Sent>,
     sequence: u16,
+    /// Whether 802.11 stations ack the Timing Measurement frames.
+    acks: bool,
 }
 
 impl Bench {
@@ -154,6 +171,7 @@ impl Bench {
             now: Duration::ZERO,
             sent: Vec::new(),
             sequence: 0,
+            acks: true,
         };
         for port in 1..=3 {
             bench.relay.set_port(Duration::ZERO, port, true);
@@ -277,6 +295,39 @@ impl Bench {
     /// has the neighbors answer Pdelay requests.
     fn drain(&mut self) {
         while let Some(transmit) = self.relay.poll_transmit() {
+            if let Destination::Measurement { dialog_token, .. } = transmit.destination {
+                // The station acks it after the air both ways and its
+                // turnaround; the radio stamps both.
+                let left = local(self.now) + TRANSMIT_LATENCY;
+                if self.acks {
+                    let departure = self.stamp(transmit.port, left);
+                    let ack_arrival = self.stamp(transmit.port, left + 2 * AIR + SIFS).port;
+                    self.relay.handle_measurement_confirm(
+                        transmit.port,
+                        dialog_token,
+                        departure,
+                        ack_arrival,
+                    );
+                }
+                self.sent.push(Sent {
+                    now: self.now,
+                    port: transmit.port,
+                    frame: transmit.frame,
+                    left: Some(left),
+                    destination: transmit.destination,
+                });
+                continue;
+            }
+            if let Destination::Action { .. } = transmit.destination {
+                self.sent.push(Sent {
+                    now: self.now,
+                    port: transmit.port,
+                    frame: transmit.frame,
+                    left: None,
+                    destination: transmit.destination,
+                });
+                continue;
+            }
             let left = transmit.stamp.map(|_| local(self.now) + TRANSMIT_LATENCY);
             if let (Some((message_type, sequence)), Some(left)) = (transmit.stamp, left) {
                 let stamp = self.stamp(transmit.port, left);
@@ -297,6 +348,7 @@ impl Bench {
                 port: transmit.port,
                 frame: transmit.frame,
                 left,
+                destination: transmit.destination,
             });
         }
     }
@@ -340,13 +392,75 @@ impl Bench {
         after: Duration,
     ) -> impl Iterator<Item = &Sent> {
         self.sent.iter().filter(move |sent| {
-            sent.port == port && sent.now > after && sent.message().message_type() == message_type
+            sent.port == port
+                && sent.now > after
+                && sent.is_gptp()
+                && sent.message().message_type() == message_type
         })
     }
 
     fn events(&mut self) -> Vec<Event> {
         core::iter::from_fn(|| self.relay.poll_event()).collect()
     }
+
+    /// The neighbor's Signaling saying it runs gPTP, once a second.
+    fn say_gptp_capable(&mut self, neighbor: &Neighbor) {
+        let mut tlv = [0; 16];
+        let length = Tlv::GptpCapable(GptpCapable {
+            tlv_type: 0x8000,
+            log_interval: 0,
+            flags: 0,
+        })
+        .encode(&mut tlv)
+        .expect("encodes");
+        let signaling = Message {
+            header: neighbor.header(1, 0, 5, 0x7f),
+            body: Body::Signaling {
+                target: PortIdentity {
+                    clock: ClockIdentity(u64::MAX),
+                    port: u16::MAX,
+                },
+            },
+            tlvs: &tlv[..length],
+        };
+        self.deliver(neighbor.port, &signaling, local(self.now));
+    }
+
+    /// Steps the relay's timeouts up to now.
+    fn settle(&mut self) {
+        while self.relay.poll_timeout().is_some_and(|due| due <= self.now) {
+            self.relay.handle_timeout(self.now);
+            self.drain();
+        }
+    }
+
+    /// The Action frames sent on `port` from `from` on in `sent`, of the
+    /// destination `kind` picks.
+    fn actions_on(
+        &self,
+        port: u16,
+        from: usize,
+        kind: fn(&Destination) -> bool,
+    ) -> Vec<(Vec<u8>, Option<i128>)> {
+        self.sent[from..]
+            .iter()
+            .filter(|sent| sent.port == port && kind(&sent.destination))
+            .map(|sent| (sent.frame.clone(), sent.left))
+            .collect()
+    }
+}
+
+fn is_measurement(destination: &Destination) -> bool {
+    matches!(destination, Destination::Measurement { .. })
+}
+
+fn is_action(destination: &Destination) -> bool {
+    matches!(destination, Destination::Action { .. })
+}
+
+/// A time in nanoseconds as FTM's TOD and TOA carry it.
+fn picoseconds(nanos: i128) -> u64 {
+    ((nanos * 1_000) as u64) & ((1 << 48) - 1)
 }
 
 #[test]
@@ -831,27 +945,7 @@ fn each_port_says_it_runs_gptp_and_hears_its_neighbor_say_so() {
     assert!(said.len() >= 3, "once a second, {}", said.len());
     assert_eq!(said[0].tlv_type, 0x8000);
     assert!(!bench.relay.neighbor_gptp_capable(bench.now, 1));
-    let neighbor = endpoint(1, 0x10);
-    let mut tlv = [0; 16];
-    let length = Tlv::GptpCapable(GptpCapable {
-        tlv_type: 0x8000,
-        log_interval: 0,
-        flags: 0,
-    })
-    .encode(&mut tlv)
-    .expect("encodes");
-    let signaling = Message {
-        header: neighbor.header(1, 0, 5, 0x7f),
-        body: Body::Signaling {
-            target: PortIdentity {
-                clock: ClockIdentity(u64::MAX),
-                port: u16::MAX,
-            },
-        },
-        tlvs: &tlv[..length],
-    };
-    let now = local(bench.now);
-    bench.deliver(1, &signaling, now);
+    bench.say_gptp_capable(&endpoint(1, 0x10));
     assert!(bench.relay.neighbor_gptp_capable(bench.now, 1));
     // Nine intervals on with no word, it lapses.
     let later = bench.now + Duration::from_secs(10);
@@ -977,4 +1071,615 @@ fn a_sync_followed_by_a_frame_without_a_time_stamp_is_left_out() {
     assert_eq!(bench.relay.last_sync(), synced);
     bench.run(bench.now + Duration::from_millis(125));
     assert_eq!(bench.relay.last_sync(), Some(local(bench.now)));
+}
+
+/// The Timing Measurement frames sent on `port`, decoded, with when each
+/// left on the LocalClock.
+fn timing_measurements(bench: &Bench, port: u16) -> Vec<(TimingMeasurement, i128)> {
+    bench
+        .sent
+        .iter()
+        .filter(|sent| {
+            sent.port == port && matches!(sent.destination, Destination::Measurement { .. })
+        })
+        .map(|sent| {
+            (
+                TimingMeasurement::decode(&sent.frame).expect("decodes"),
+                sent.left.expect("left"),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn an_802_11_port_carries_the_grandmasters_time_in_timing_measurement_frames() {
+    // The radio's clock 3 s behind the LocalClock and 12 ppm fast.
+    let radio = 1.0 + 12e-6;
+    let mut bench = Bench::with_clocks(
+        std::vec![grandmaster(), endpoint(3, 0x40)],
+        [(0, 1.0), (-3 * SECOND, radio), (0, 1.0)],
+    );
+    bench
+        .relay
+        .set_wireless(bench.now, 2, Some(STATION), Support::TIMING_MEASUREMENT);
+    bench.drain();
+    bench.run(Duration::from_secs(10));
+    assert!(bench.relay.as_capable(2));
+    assert_eq!(bench.relay.role(2), Some(Role::TimeTransmitter));
+    let gm = grandmaster();
+
+    // Each frame carries the one before: when it left, on the radio's
+    // clock, and its Follow_Up, saying the grandmaster's time then.
+    let frames = timing_measurements(&bench, 2);
+    let mut checked = 0;
+    for (frame, _) in frames
+        .iter()
+        .filter(|(frame, _)| frame.follow_up_dialog_token != 0)
+    {
+        let (_, left) = frames
+            .iter()
+            .find(|(earlier, _)| earlier.dialog_token == frame.follow_up_dialog_token)
+            .expect("the frame it follows up");
+        let departure = bench.stamp(2, *left);
+        assert_eq!(frame.tod, departure.port.div_euclid(10) as u32);
+        let ack = bench.stamp(2, left + 2 * AIR + SIFS);
+        assert_eq!(frame.toa, ack.port.div_euclid(10) as u32);
+        let message = frame.follow_up_message().expect("a Follow_Up");
+        let Body::FollowUp { precise_origin } = message.body else {
+            panic!("not a Follow_Up");
+        };
+        let said = precise_origin.nanos() + correction_nanos(message.header.correction);
+        let actual = gm.clock(*left);
+        assert!((said - actual).abs() <= 3, "off by {} ns", said - actual);
+        // The station measures the radio's clock, so the rate is the
+        // grandmaster's over it.
+        let information = message.follow_up_information().expect("information");
+        let rate = 1.0 + f64::from(information.cumulative_scaled_rate_offset) / RATE_SCALE;
+        assert!((rate - gm.rate / radio).abs() < 1e-9, "rate {rate}");
+        assert_eq!(
+            message.header.source,
+            PortIdentity {
+                clock: ours(),
+                port: 2
+            }
+        );
+        checked += 1;
+    }
+    assert!(checked >= 20, "{checked} frames followed up");
+
+    // Announce and Signaling go to the station's own address; no Pdelay
+    // or Sync on the port, and the wired port relays as before.
+    let after = Duration::from_secs(1);
+    let announces: Vec<_> = bench.sent_on(2, MessageType::Announce, after).collect();
+    assert!(!announces.is_empty());
+    assert!(
+        announces
+            .iter()
+            .all(|sent| sent.destination == Destination::Station(STATION))
+    );
+    assert_eq!(bench.sent_on(2, MessageType::PdelayReq, after).count(), 0);
+    assert_eq!(bench.sent_on(2, MessageType::Sync, after).count(), 0);
+    assert!(bench.sent_on(3, MessageType::Sync, after).count() >= 20);
+    assert!(
+        bench
+            .sent_on(3, MessageType::Sync, after)
+            .all(|sent| sent.destination == Destination::Group)
+    );
+}
+
+#[test]
+fn unacked_frames_are_not_followed_up() {
+    let mut bench = Bench::new(std::vec![grandmaster()]);
+    bench
+        .relay
+        .set_wireless(bench.now, 2, Some(STATION), Support::TIMING_MEASUREMENT);
+    bench.acks = false;
+    bench.run(Duration::from_secs(5));
+    let frames = timing_measurements(&bench, 2);
+    assert!(frames.len() >= 20);
+    assert!(
+        frames
+            .iter()
+            .all(|(frame, _)| frame.follow_up_dialog_token == 0 && frame.follow_up.is_none())
+    );
+}
+
+#[test]
+fn an_802_11_port_needs_a_station_that_does_timing_measurement() {
+    let mut bench = Bench::new(std::vec![grandmaster()]);
+    bench
+        .relay
+        .set_wireless(bench.now, 2, None, Support::TIMING_MEASUREMENT);
+    bench.drain();
+    let start = bench.sent.len();
+    bench.run(Duration::from_secs(5));
+    assert!(!bench.relay.as_capable(2));
+    assert_eq!(
+        bench.relay.incapable_because(2),
+        Some(link::Incapable::NoStation)
+    );
+    assert!(bench.sent[start..].iter().all(|sent| sent.port != 2));
+
+    bench
+        .relay
+        .set_wireless(bench.now, 2, Some(STATION), Support::NONE);
+    assert!(!bench.relay.as_capable(2));
+    assert_eq!(
+        bench.relay.incapable_because(2),
+        Some(link::Incapable::NoMeasurement)
+    );
+
+    bench
+        .relay
+        .set_wireless(bench.now, 2, Some(STATION), Support::TIMING_MEASUREMENT);
+    assert!(bench.relay.as_capable(2));
+    assert_eq!(bench.relay.incapable_because(2), None);
+}
+
+#[test]
+fn an_802_11_timereceiver_follows_the_grandmaster_its_frames_carry() {
+    // An access point that is the grandmaster, its radio's clock its time;
+    // the relay's radio 2 s ahead of the LocalClock and 8 ppm slow.
+    let mut access_point = grandmaster();
+    access_point.syncs = false;
+    access_point.answers = false;
+    let mut bench = Bench::with_clocks(
+        std::vec![access_point.clone(), endpoint(2, 0x30)],
+        [(2 * SECOND, 1.0 - 8e-6), (0, 1.0), (0, 1.0)],
+    );
+    bench.relay.set_wireless(
+        bench.now,
+        1,
+        Some(ACCESS_POINT),
+        Support::TIMING_MEASUREMENT,
+    );
+    bench.drain();
+    let (system, steps, path) = access_point.announces.clone().expect("announces");
+    let mut transmitter = dot11::Transmitter::new();
+    let step = Duration::from_millis(125);
+    for index in 0..80u16 {
+        bench.now += step;
+        let now = bench.now;
+        bench.sequence = bench.sequence.wrapping_add(1);
+        if now.subsec_millis() == 0 {
+            bench.announce(&access_point, &system, steps, &path);
+        }
+        // A frame from the access point, and its Ack.
+        let left = local(now);
+        let frame = transmitter.next_frame();
+        let arrival = bench.stamp(1, left + AIR);
+        let ack_departure = bench.stamp(1, left + AIR + SIFS).port;
+        bench
+            .relay
+            .handle_measurement(now, 1, &frame.encode(), arrival, ack_departure);
+        bench.drain();
+        // What the access point's radio stamped, and the Follow_Up for the
+        // frame: the grandmaster's time when it left.
+        transmitter.confirmed(
+            frame.dialog_token,
+            access_point.clock(left),
+            access_point.clock(left + 2 * AIR + SIFS),
+        );
+        let mut tlvs = [0; 32];
+        let length = Tlv::FollowUpInformation(FollowUpInformation::default())
+            .encode(&mut tlvs)
+            .expect("encodes");
+        let follow_up = Message {
+            header: access_point.header(index, Flags::PTP_TIMESCALE, 2, -3),
+            body: Body::FollowUp {
+                precise_origin: Timestamp::from_nanos(access_point.clock(left)).expect("origin"),
+            },
+            tlvs: &tlvs[..length],
+        };
+        let mut octets = [0; dot11::FOLLOW_UP_LENGTH];
+        follow_up.encode(&mut octets).expect("encodes");
+        transmitter.set_follow_up(frame.dialog_token, &octets);
+        while bench.relay.poll_timeout().is_some_and(|due| due <= now) {
+            bench.relay.handle_timeout(now);
+            bench.drain();
+        }
+    }
+    assert_eq!(bench.relay.role(1), Some(Role::TimeReceiver));
+    assert_eq!(
+        bench.relay.grandmaster().map(|system| system.clock),
+        Some(access_point.identity.clock)
+    );
+    // The radio's 10 ns units leave the link delay and the rate over a
+    // frame's interval each good to about that.
+    let local_now = local(bench.now);
+    let time = bench.relay.grandmaster_time(local_now).expect("time");
+    let off = time - access_point.clock(local_now);
+    assert!(off.abs() <= 30, "off by {off} ns");
+
+    // And it relays that time on its wired port.
+    let after = Duration::from_secs(6);
+    let syncs: Vec<_> = bench.sent_on(2, MessageType::Sync, after).collect();
+    let follow_ups: Vec<_> = bench.sent_on(2, MessageType::FollowUp, after).collect();
+    assert!(follow_ups.len() >= 20, "{} follow ups", follow_ups.len());
+    for follow_up in &follow_ups {
+        let message = follow_up.message();
+        let sync = syncs
+            .iter()
+            .find(|sync| sync.message().header.sequence_id == message.header.sequence_id)
+            .expect("its sync");
+        let Body::FollowUp { precise_origin } = message.body else {
+            panic!("not a follow up");
+        };
+        let said = precise_origin.nanos() + correction_nanos(message.header.correction);
+        let actual = access_point.clock(sync.left.expect("stamped"));
+        assert!((said - actual).abs() <= 30, "off by {} ns", said - actual);
+    }
+}
+
+/// A Follow_Up from `neighbor` saying `time` for the frame it follows up.
+fn follow_up_octets(
+    neighbor: &Neighbor,
+    sequence: u16,
+    time: i128,
+) -> [u8; dot11::FOLLOW_UP_LENGTH] {
+    let mut tlvs = [0; 32];
+    let length = Tlv::FollowUpInformation(FollowUpInformation::default())
+        .encode(&mut tlvs)
+        .expect("encodes");
+    let follow_up = Message {
+        header: neighbor.header(sequence, Flags::PTP_TIMESCALE, 2, -3),
+        body: Body::FollowUp {
+            precise_origin: Timestamp::from_nanos(time).expect("origin"),
+        },
+        tlvs: &tlvs[..length],
+    };
+    let mut octets = [0; dot11::FOLLOW_UP_LENGTH];
+    follow_up.encode(&mut octets).expect("encodes");
+    octets
+}
+
+#[test]
+fn an_802_11_port_answers_ftm_requests_with_the_grandmasters_time() {
+    // The radio's clock 3 s behind the LocalClock and 12 ppm fast; the
+    // station's runs as the LocalClock.
+    let radio = 1.0 + 12e-6;
+    let mut bench = Bench::with_clocks(
+        std::vec![grandmaster(), endpoint(3, 0x40)],
+        [(0, 1.0), (-3 * SECOND, radio), (0, 1.0)],
+    );
+    bench.relay.set_wireless(
+        bench.now,
+        2,
+        Some(STATION),
+        Support::FINE_TIMING_MEASUREMENT,
+    );
+    bench.drain();
+    // FTM alone needs the station's word that it runs gPTP.
+    assert_eq!(
+        bench.relay.incapable_because(2),
+        Some(link::Incapable::NotGptpCapable)
+    );
+    let gm = grandmaster();
+    let (system, steps, path) = gm.announces.clone().expect("announces");
+    let station = endpoint(2, 0x50);
+    let mut initiator = ftm::Initiator::new(-3);
+    let mut measured = Vec::new();
+    let mut handed = 0;
+    while bench.now < Duration::from_secs(10) {
+        bench.now += Duration::from_millis(1);
+        let now = bench.now;
+        if now.as_millis().is_multiple_of(125) {
+            bench.sequence = bench.sequence.wrapping_add(1);
+            if now.subsec_millis() == 0 {
+                bench.announce(&gm, &system, steps, &path);
+                bench.say_gptp_capable(&station);
+            }
+            bench.sync(&gm);
+        }
+        if let Some(request) = initiator.poll_request(now) {
+            bench.relay.handle_ftm_request(now, 2, &request.encode());
+            bench.drain();
+        }
+        bench.settle();
+        // The station hears each frame over the air and acks it a SIFS
+        // later, as the bench's acks have it.
+        let frames = bench.actions_on(2, handed, is_measurement);
+        handed = bench.sent.len();
+        for (frame, left) in frames {
+            let frame = FineTimingMeasurement::decode(&frame).expect("an FTM frame");
+            let arrived = left.expect("left") + AIR;
+            if let Some(measurement) =
+                initiator.frame(now, &frame, Stamp::local(arrived), arrived + SIFS)
+            {
+                measured.push(measurement);
+            }
+        }
+    }
+    assert!(bench.relay.as_capable(2));
+    assert_eq!(bench.relay.role(2), Some(Role::TimeTransmitter));
+
+    // Each frame but a burst's first carries the one before: when it left
+    // and its Ack came back, on the radio's clock in picoseconds, and its
+    // Follow_Up, saying the grandmaster's time then.
+    let frames: Vec<(FineTimingMeasurement, i128)> = bench
+        .actions_on(2, 0, is_measurement)
+        .into_iter()
+        .map(|(frame, left)| {
+            (
+                FineTimingMeasurement::decode(&frame).expect("only FTM frames"),
+                left.expect("left"),
+            )
+        })
+        .collect();
+    let mut checked = 0;
+    for (at, (frame, _)) in frames.iter().enumerate() {
+        if frame.follow_up_dialog_token == 0 {
+            continue;
+        }
+        let (_, left) = frames[..at]
+            .iter()
+            .rev()
+            .find(|(earlier, _)| earlier.dialog_token == frame.follow_up_dialog_token)
+            .expect("the frame it follows up");
+        assert_eq!(frame.tod, picoseconds(bench.stamp(2, *left).port));
+        assert_eq!(
+            frame.toa,
+            picoseconds(bench.stamp(2, left + 2 * AIR + SIFS).port)
+        );
+        let message = frame.follow_up_message().expect("a Follow_Up");
+        let Body::FollowUp { precise_origin } = message.body else {
+            panic!("not a Follow_Up");
+        };
+        let said = precise_origin.nanos() + correction_nanos(message.header.correction);
+        let actual = gm.clock(*left);
+        assert!((said - actual).abs() <= 3, "off by {} ns", said - actual);
+        let information = message.follow_up_information().expect("information");
+        let rate = 1.0 + f64::from(information.cumulative_scaled_rate_offset) / RATE_SCALE;
+        assert!((rate - gm.rate / radio).abs() < 1e-9, "rate {rate}");
+        checked += 1;
+    }
+    assert!(checked >= 40, "{checked} frames followed up");
+
+    // The station measures the radio's rate and the air between them.
+    assert!(measured.len() >= 20, "{} measurements", measured.len());
+    for measurement in &measured[2..] {
+        assert!(
+            (measurement.neighbor_rate_ratio - radio).abs() < 1e-8,
+            "rate {}",
+            measurement.neighbor_rate_ratio
+        );
+        assert!(
+            (measurement.mean_link_delay - AIR as f64).abs() < 2.0,
+            "delay {}",
+            measurement.mean_link_delay
+        );
+    }
+    let after = Duration::from_secs(2);
+    assert_eq!(bench.sent_on(2, MessageType::Sync, after).count(), 0);
+    assert_eq!(bench.sent_on(2, MessageType::FollowUp, after).count(), 0);
+    assert!(bench.sent_on(3, MessageType::Sync, after).count() >= 60);
+}
+
+#[test]
+fn an_802_11_timereceiver_follows_the_grandmaster_its_ftm_bursts_carry() {
+    // An access point that is the grandmaster, its radio's clock its time,
+    // taking part in both ways; the relay's radio 2 s ahead of the
+    // LocalClock and 8 ppm slow.
+    let mut access_point = grandmaster();
+    access_point.syncs = false;
+    access_point.answers = false;
+    let mut bench = Bench::with_clocks(
+        std::vec![access_point.clone(), endpoint(2, 0x30)],
+        [(2 * SECOND, 1.0 - 8e-6), (0, 1.0), (0, 1.0)],
+    );
+    bench
+        .relay
+        .set_wireless(bench.now, 1, Some(ACCESS_POINT), Support::BOTH);
+    bench.drain();
+    let (system, steps, path) = access_point.announces.clone().expect("announces");
+    let mut responder = ftm::Responder::new();
+    let mut asked = 0;
+    let mut requests = 0;
+    let mut sequence = 0;
+    while bench.now < Duration::from_secs(10) {
+        bench.now += Duration::from_millis(1);
+        let now = bench.now;
+        if now.subsec_millis() == 0 {
+            bench.sequence = bench.sequence.wrapping_add(1);
+            bench.announce(&access_point, &system, steps, &path);
+        }
+        bench.settle();
+        // The relay's requests reach the access point, whose frames reach
+        // the relay, each acked a SIFS after it arrived.
+        let mut frames = Vec::new();
+        for (request, _) in bench.actions_on(1, asked, is_action) {
+            let request = FtmRequest::decode(&request).expect("an FTM Request");
+            requests += 1;
+            frames.extend(responder.request(now, &request));
+        }
+        asked = bench.sent.len();
+        frames.extend(responder.poll_frame(now));
+        for frame in frames {
+            let left = local(now);
+            let arrival = bench.stamp(1, left + AIR);
+            let ack_departure = bench.stamp(1, left + AIR + SIFS).port;
+            bench
+                .relay
+                .handle_measurement(now, 1, &frame.encode(), arrival, ack_departure);
+            bench.drain();
+            if frame.dialog_token != 0 {
+                responder.confirmed(
+                    frame.dialog_token,
+                    access_point.clock(left),
+                    access_point.clock(left + 2 * AIR + SIFS),
+                );
+                sequence += 1;
+                let octets = follow_up_octets(&access_point, sequence, access_point.clock(left));
+                responder.set_follow_up(frame.dialog_token, &octets);
+            }
+        }
+    }
+    assert_eq!(bench.relay.role(1), Some(Role::TimeReceiver));
+    assert_eq!(
+        bench.relay.grandmaster().map(|system| system.clock),
+        Some(access_point.identity.clock)
+    );
+    // A burst asked for each Sync interval.
+    assert!((70..=82).contains(&requests), "{requests} requests");
+    // FTM's picoseconds leave the time good to the nanoseconds the bench
+    // stamps in.
+    let local_now = local(bench.now);
+    let time = bench.relay.grandmaster_time(local_now).expect("time");
+    let off = time - access_point.clock(local_now);
+    assert!(off.abs() <= 5, "off by {off} ns");
+
+    // And it relays that time on its wired port.
+    let after = Duration::from_secs(6);
+    let syncs: Vec<_> = bench.sent_on(2, MessageType::Sync, after).collect();
+    let follow_ups: Vec<_> = bench.sent_on(2, MessageType::FollowUp, after).collect();
+    assert!(follow_ups.len() >= 25, "{} follow ups", follow_ups.len());
+    for follow_up in &follow_ups {
+        let message = follow_up.message();
+        let sync = syncs
+            .iter()
+            .find(|sync| sync.message().header.sequence_id == message.header.sequence_id)
+            .expect("its sync");
+        let Body::FollowUp { precise_origin } = message.body else {
+            panic!("not a follow up");
+        };
+        let said = precise_origin.nanos() + correction_nanos(message.header.correction);
+        let actual = access_point.clock(sync.left.expect("stamped"));
+        assert!((said - actual).abs() <= 5, "off by {} ns", said - actual);
+    }
+}
+
+/// Answers the FTM Requests sent on `port` from `from` on in the bench's
+/// frames with a refusal, and says how many there were.
+fn refuse_requests(bench: &mut Bench, port: u16, from: usize) -> usize {
+    let requests = bench.actions_on(port, from, is_action);
+    for (request, _) in &requests {
+        let asked = FtmRequest::decode(request)
+            .expect("an FTM Request")
+            .parameters
+            .expect("parameters");
+        let refusal = FineTimingMeasurement {
+            dialog_token: 0,
+            follow_up_dialog_token: 0,
+            tod: 0,
+            toa: 0,
+            tod_error: 0,
+            toa_error: 0,
+            parameters: Some(ftm::FtmParameters {
+                status: ftm::STATUS_INCAPABLE,
+                ftms_per_burst: asked.ftms_per_burst,
+                ..Default::default()
+            }),
+            follow_up: None,
+        };
+        let arrival = bench.stamp(port, local(bench.now));
+        bench
+            .relay
+            .handle_measurement(bench.now, port, &refusal.encode(), arrival, 0);
+        bench.drain();
+    }
+    requests.len()
+}
+
+#[test]
+fn ftm_alone_needs_the_neighbors_word_and_bursts_it_grants() {
+    let mut access_point = grandmaster();
+    access_point.syncs = false;
+    access_point.answers = false;
+    let (system, steps, path) = access_point.announces.clone().expect("announces");
+    let mut bench = Bench::new(std::vec![access_point.clone()]);
+    bench.relay.set_wireless(
+        bench.now,
+        1,
+        Some(ACCESS_POINT),
+        Support::FINE_TIMING_MEASUREMENT,
+    );
+    bench.drain();
+    assert_eq!(
+        bench.relay.incapable_because(1),
+        Some(link::Incapable::NotGptpCapable)
+    );
+    bench.now += Duration::from_millis(1);
+    bench.say_gptp_capable(&access_point);
+    assert!(bench.relay.as_capable(1));
+    bench.announce(&access_point, &system, steps, &path);
+    assert_eq!(bench.relay.role(1), Some(Role::TimeReceiver));
+
+    // Three frames refused, and then two: not asCapable.
+    let start = bench.sent.len();
+    bench.settle();
+    assert_eq!(refuse_requests(&mut bench, 1, start), 1);
+    let retry = bench.sent.len();
+    bench.settle();
+    assert_eq!(refuse_requests(&mut bench, 1, retry), 1);
+    assert!(!bench.relay.as_capable(1));
+    assert_eq!(
+        bench.relay.incapable_because(1),
+        Some(link::Incapable::FtmRefused)
+    );
+    assert_eq!(bench.relay.role(1), Some(Role::Disabled));
+
+    // It asks again at the next interval, and a burst granted then makes
+    // it asCapable again.
+    let mut responder = ftm::Responder::new();
+    let waiting = bench.sent.len();
+    bench.now += Duration::from_millis(124);
+    bench.settle();
+    assert!(bench.actions_on(1, waiting, is_action).is_empty());
+    bench.now += Duration::from_millis(1);
+    bench.settle();
+    let asked = bench.actions_on(1, waiting, is_action);
+    assert_eq!(asked.len(), 1);
+    let request = FtmRequest::decode(&asked[0].0).expect("an FTM Request");
+    let granted = responder.request(bench.now, &request).expect("granted");
+    let arrival = bench.stamp(1, local(bench.now));
+    bench
+        .relay
+        .handle_measurement(bench.now, 1, &granted.encode(), arrival, 0);
+    bench.drain();
+    assert!(bench.relay.as_capable(1));
+
+    // Without the neighbor's word for nine intervals, it is not.
+    let lapse = bench.now + Duration::from_secs(10);
+    while bench.now < lapse {
+        bench.now += Duration::from_millis(5);
+        bench.settle();
+    }
+    assert_eq!(
+        bench.relay.incapable_because(1),
+        Some(link::Incapable::NotGptpCapable)
+    );
+    assert!(!bench.relay.as_capable(1));
+}
+
+#[test]
+fn bursts_refused_fall_back_to_timing_measurement_where_the_station_has_it() {
+    let mut access_point = grandmaster();
+    access_point.syncs = false;
+    access_point.answers = false;
+    let (system, steps, path) = access_point.announces.clone().expect("announces");
+    let mut bench = Bench::new(std::vec![access_point.clone()]);
+    bench
+        .relay
+        .set_wireless(bench.now, 1, Some(ACCESS_POINT), Support::BOTH);
+    bench.drain();
+    // Timing Measurement on domain 0 needs no word that it runs gPTP.
+    assert!(bench.relay.as_capable(1));
+    bench.now += Duration::from_millis(1);
+    bench.announce(&access_point, &system, steps, &path);
+    assert_eq!(bench.relay.role(1), Some(Role::TimeReceiver));
+    let start = bench.sent.len();
+    bench.settle();
+    assert_eq!(refuse_requests(&mut bench, 1, start), 1);
+    let retry = bench.sent.len();
+    bench.settle();
+    assert_eq!(refuse_requests(&mut bench, 1, retry), 1);
+    // Still asCapable, with Timing Measurement now: no more requests.
+    assert!(bench.relay.as_capable(1));
+    assert_eq!(bench.relay.role(1), Some(Role::TimeReceiver));
+    let after = bench.sent.len();
+    while bench.now < Duration::from_secs(2) {
+        bench.now += Duration::from_millis(5);
+        bench.settle();
+    }
+    assert!(bench.actions_on(1, after, is_action).is_empty());
 }

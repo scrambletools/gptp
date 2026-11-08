@@ -102,8 +102,21 @@ pub fn wait_any_or(
     also: std::os::fd::BorrowedFd<'_>,
     timeout: Option<Duration>,
 ) -> io::Result<(Vec<usize>, bool)> {
+    wait_any_with(sockets, &[also], timeout)
+        .map(|(readable, others)| (readable, !others.is_empty()))
+}
+
+/// As [`wait_any`], waking also when any of `others` has something to
+/// read: the positions of the sockets with one to receive, and those of
+/// `others` with something.
+#[cfg(target_os = "linux")]
+pub fn wait_any_with(
+    sockets: &[&StampedSocket],
+    others: &[std::os::fd::BorrowedFd<'_>],
+    timeout: Option<Duration>,
+) -> io::Result<(Vec<usize>, Vec<usize>)> {
     let inner: Vec<&platform::StampedSocket> = sockets.iter().map(|socket| &socket.inner).collect();
-    platform::wait_any_or(&inner, Some(also), timeout)
+    platform::wait_any_or(&inner, others, timeout)
 }
 
 /// Has `interface` stamp every frame it receives and the frames sent that
@@ -308,19 +321,19 @@ mod platform {
         sockets: &[&StampedSocket],
         timeout: Option<Duration>,
     ) -> io::Result<Vec<usize>> {
-        wait_any_or(sockets, None, timeout).map(|(readable, _)| readable)
+        wait_any_or(sockets, &[], timeout).map(|(readable, _)| readable)
     }
 
     pub fn wait_any_or(
         sockets: &[&StampedSocket],
-        also: Option<std::os::fd::BorrowedFd<'_>>,
+        others: &[std::os::fd::BorrowedFd<'_>],
         timeout: Option<Duration>,
-    ) -> io::Result<(Vec<usize>, bool)> {
+    ) -> io::Result<(Vec<usize>, Vec<usize>)> {
         let deadline = timeout.map(|timeout| std::time::Instant::now() + timeout);
         let mut polls: Vec<libc::pollfd> = sockets
             .iter()
             .map(|socket| socket.fd.as_raw_fd())
-            .chain(also.map(|also| also.as_raw_fd()))
+            .chain(others.iter().map(|other| other.as_raw_fd()))
             .map(|fd| libc::pollfd {
                 fd,
                 events: libc::POLLIN,
@@ -352,9 +365,12 @@ mod platform {
                 .filter(|(_, poll)| poll.revents & libc::POLLIN != 0)
                 .map(|(position, _)| position)
                 .collect();
-            let also_ready = polls[sockets.len()..]
+            let others_ready: Vec<usize> = polls[sockets.len()..]
                 .iter()
-                .any(|poll| poll.revents & (libc::POLLIN | libc::POLLERR) != 0);
+                .enumerate()
+                .filter(|(_, poll)| poll.revents & (libc::POLLIN | libc::POLLERR) != 0)
+                .map(|(position, _)| position)
+                .collect();
             // A time on the error queue that no one waited for would wake
             // every poll until taken.
             for (socket, poll) in sockets.iter().zip(&polls) {
@@ -363,11 +379,11 @@ mod platform {
                 }
             }
             if !readable.is_empty()
-                || also_ready
+                || !others_ready.is_empty()
                 || ready == 0
                 || left.is_some_and(|left| left.is_zero())
             {
-                return Ok((readable, also_ready));
+                return Ok((readable, others_ready));
             }
         }
     }
