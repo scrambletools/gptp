@@ -211,7 +211,10 @@ struct Port {
     stamps_every_frame: bool,
     /// Times left out, the frame after them having come without one.
     distrusted: u64,
-    /// An 802.11 port's radio, whose Action frames carry the timing.
+    /// Whether the port is an 802.11 port.
+    wireless: bool,
+    /// An 802.11 port's radio, whose Action frames carry the timing,
+    /// opened while the port is up.
     wifi: Option<WifiPort>,
 }
 
@@ -248,6 +251,8 @@ struct Daemon {
     utc_offset: i16,
     /// Ports whose sending found the network down, to take down.
     gone: Vec<usize>,
+    /// What to take an 802.11 port's station to measure with, where told.
+    wifi_support: Option<Support>,
 }
 
 /// A port's number in the relay, from its place among the ports.
@@ -280,6 +285,7 @@ impl Daemon {
             .end_station
             .as_ref()
             .is_some_and(|end| end.station.awaiting_rebase());
+        let mut reopen = Vec::new();
         for (index, port) in self.ports.iter_mut().enumerate() {
             // operstate, not carrier: reading carrier waits for RTNL, so
             // while another program held it, a Wi-Fi driver restarting its
@@ -314,6 +320,15 @@ impl Daemon {
                     "not in the bridge"
                 }
             );
+            // hostapd stopping takes the frames registered for, and a radio
+            // opened before hostapd made it an access point is a station's,
+            // so it is opened afresh each time the port comes up.
+            if port.wireless {
+                port.wifi = None;
+                if up {
+                    reopen.push(index);
+                }
+            }
             let lite = self.end_station.as_mut().map(|end| &mut end.lite);
             match lite {
                 Some(lite) => {
@@ -325,6 +340,38 @@ impl Daemon {
                 }
                 None => self.relay.set_port(now, number(index), up),
             }
+        }
+        for index in reopen {
+            self.open_radio(index);
+        }
+    }
+
+    /// Opens 802.11 port `index`'s radio, its station chosen afresh.
+    fn open_radio(&mut self, index: usize) {
+        let now = self.now();
+        let port = &mut self.ports[index];
+        let mut wifi = match WifiPort::open(&port.name, self.wifi_support) {
+            Ok(wifi) => wifi,
+            Err(error) => {
+                eprintln!("{error}");
+                return;
+            }
+        };
+        eprintln!(
+            "{}: an 802.11 port, as {}",
+            port.name,
+            if wifi.access_point() {
+                "access point"
+            } else {
+                "station"
+            }
+        );
+        let chosen = wifi.choose();
+        port.wifi = Some(wifi);
+        self.relay
+            .set_wireless(now, number(index), None, Support::NONE);
+        if let Some(heard) = chosen {
+            self.hear(index, heard);
         }
     }
 
@@ -1012,11 +1059,8 @@ fn run(options: Options) -> Result<(), String> {
             outliers: 0,
             stamps_every_frame: false,
             distrusted: 0,
-            wifi: if wireless {
-                Some(WifiPort::open(name, options.wifi_support)?)
-            } else {
-                None
-            },
+            wireless,
+            wifi: None,
         });
     }
     let end_station = match options.station() {
@@ -1112,29 +1156,15 @@ fn run(options: Options) -> Result<(), String> {
         end_station,
         utc_offset: utc,
         gone: Vec::new(),
+        wifi_support: options.wifi_support,
     };
     // An 802.11 port measures no link with Pdelay: its station, once one
-    // is there, with Action frames.
+    // is there, with Action frames, through its radio opened as it comes up.
     for index in 0..daemon.ports.len() {
-        let port = &mut daemon.ports[index];
-        let Some(wifi) = port.wifi.as_mut() else {
-            continue;
-        };
-        eprintln!(
-            "{}: an 802.11 port, as {}",
-            port.name,
-            if wifi.access_point() {
-                "access point"
-            } else {
-                "station"
-            }
-        );
-        let chosen = wifi.choose();
-        daemon
-            .relay
-            .set_wireless(Duration::ZERO, number(index), None, Support::NONE);
-        if let Some(heard) = chosen {
-            daemon.hear(index, heard);
+        if daemon.ports[index].wireless {
+            daemon
+                .relay
+                .set_wireless(Duration::ZERO, number(index), None, Support::NONE);
         }
     }
     let links = LinkChanges::open()

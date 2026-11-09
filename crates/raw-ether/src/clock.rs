@@ -71,12 +71,25 @@ impl HardwareClock {
     /// [`offset_from`](Self::offset_from) with its span: the two clocks'
     /// spans together.
     pub fn reading_from(&self, other: &HardwareClock) -> io::Result<Reading> {
-        let ours = self.inner.reading_from_system(SystemClock::Realtime)?;
-        let theirs = other.inner.reading_from_system(SystemClock::Realtime)?;
+        let ours = self.system_reading(SystemClock::Realtime)?;
+        let theirs = other.system_reading(SystemClock::Realtime)?;
         Ok(Reading {
             offset: ours.offset - theirs.offset,
             span: ours.span.saturating_add(theirs.span),
         })
+    }
+
+    /// The driver's reading against `system`, or where it has none, one
+    /// read as [`reading_against`](Self::reading_against) reads it.
+    /// iwlwifi's radio clock has none: its PTP_SYS_OFFSET_PRECISE is a
+    /// firmware command of about 1 ms that logs a line each time.
+    fn system_reading(&self, system: SystemClock) -> io::Result<Reading> {
+        match self.inner.reading_from_system(system) {
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                self.reading_against(system)
+            }
+            read => read,
+        }
     }
 
     /// How far this clock is ahead of `system`, in nanoseconds, from its
@@ -92,7 +105,7 @@ impl HardwareClock {
     /// [`offset_from_system_clock`](Self::offset_from_system_clock) with
     /// the span of the reading kept.
     pub fn reading_from_system_clock(&self, system: SystemClock) -> io::Result<Reading> {
-        self.inner.reading_from_system(system)
+        self.system_reading(system)
     }
 
     /// How far the clock is ahead of this computer's monotonic clock, in
@@ -355,19 +368,15 @@ mod platform {
 
         /// The clock less the system clock, from its driver's tightest of
         /// several readings between two of the system clock
-        /// (PTP_SYS_OFFSET_EXTENDED). A driver that reads only with the
-        /// wall clock at one instant, as iwlwifi's radio clock does
-        /// (PTP_SYS_OFFSET_PRECISE), gives that for the wall clock.
+        /// (PTP_SYS_OFFSET_EXTENDED), or unsupported where it has none.
         pub fn reading_from_system(&self, system: SystemClock) -> io::Result<Reading> {
-            match self.extended_reading(system) {
-                Err(error)
-                    if error.raw_os_error() == Some(libc::EOPNOTSUPP)
-                        && system == SystemClock::Realtime =>
-                {
-                    self.precise_reading()
+            self.extended_reading(system).map_err(|error| {
+                if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+                    io::Error::new(io::ErrorKind::Unsupported, error)
+                } else {
+                    error
                 }
-                read => read,
-            }
+            })
         }
 
         fn extended_reading(&self, system: SystemClock) -> io::Result<Reading> {
@@ -423,51 +432,6 @@ mod platform {
                 })
                 .min_by_key(|reading| reading.span)
                 .ok_or_else(|| io::Error::other("the clock gave no samples"))
-        }
-
-        /// The clock less the wall clock at one instant, as the driver
-        /// crosses them (PTP_SYS_OFFSET_PRECISE): a span of 0.
-        fn precise_reading(&self) -> io::Result<Reading> {
-            /// struct ptp_clock_time, from linux/ptp_clock.h.
-            #[repr(C)]
-            #[derive(Clone, Copy, Default)]
-            struct Time {
-                seconds: i64,
-                nanoseconds: u32,
-                reserved: u32,
-            }
-            /// struct ptp_sys_offset_precise.
-            #[repr(C)]
-            #[derive(Default)]
-            struct Precise {
-                device: Time,
-                realtime: Time,
-                monotonic_raw: Time,
-                reserved: [u32; 4],
-            }
-            /// _IOWR('=', 8, struct ptp_sys_offset_precise).
-            const PTP_SYS_OFFSET_PRECISE: libc::c_ulong =
-                0xc000_0000 | ((size_of::<Precise>() as libc::c_ulong) << 16) | (0x3d << 8) | 8;
-            let mut request = Precise::default();
-            // SAFETY: `request` is the struct the ioctl takes, and lives
-            // through the call.
-            if unsafe {
-                libc::ioctl(
-                    self._fd.as_raw_fd(),
-                    PTP_SYS_OFFSET_PRECISE as _,
-                    &raw mut request,
-                )
-            } < 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            let nanos = |time: Time| {
-                i128::from(time.seconds) * 1_000_000_000 + i128::from(time.nanoseconds)
-            };
-            Ok(Reading {
-                offset: nanos(request.device) - nanos(request.realtime),
-                span: 0,
-            })
         }
     }
 

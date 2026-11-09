@@ -14,11 +14,18 @@
   `Relay::set_wireless`, which makes a port an 802.11 port towards one
   station.
 - raw-ether: `wifi`, 802.11 Action frames through nl80211 on Linux with
-  the radio's times; a hardware clock is read with
-  PTP_SYS_OFFSET_PRECISE where its driver has nothing finer, as
-  iwlwifi's.
+  the radio's times; a hardware clock whose driver has no
+  PTP_SYS_OFFSET_EXTENDED is read between two readings of the system
+  clock. iwlwifi's radio clock has none, and its
+  PTP_SYS_OFFSET_PRECISE is a firmware command of about 1 ms that
+  logs a line each time.
 - gptpd: Wi-Fi ports, their station taken from hostapd or
-  wpa_supplicant, and `--wifi-support`. Not yet run against a station.
+  wpa_supplicant, and `--wifi-support`. A Wi-Fi port's radio is opened
+  each time the port comes up: hostapd stopping takes the frames gptpd
+  registered for, and a radio opened before hostapd starts is a
+  station's. Run as an access point with one station, which follows it
+  leaving and rejoining; nothing measured yet, as the station does not
+  range.
 - gptpd reads each port's operstate, not its carrier. Reading carrier
   waits for RTNL, and while a Wi-Fi driver restarting its firmware held
   that for 3 s, no port sent a Sync or answered a Pdelay.
