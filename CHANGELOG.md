@@ -26,6 +26,9 @@
   station's. Run as an access point with one station, which follows it
   leaving and rejoining; nothing measured yet, as the station does not
   range.
+- gptpd's status names a Wi-Fi port's station, so a beacon carrier
+  sending its own Announce leaves that station to gptpd and the station
+  hears one Announce for the port.
 - gptpd reads each port's operstate, not its carrier. Reading carrier
   waits for RTNL, and while a Wi-Fi driver restarting its firmware held
   that for 3 s, no port sent a Sync or answered a Pdelay.

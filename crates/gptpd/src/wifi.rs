@@ -105,6 +105,11 @@ impl WifiPort {
         self.access_point
     }
 
+    /// The station the port is towards, once one is chosen.
+    pub fn peer(&self) -> Option<MacAddress> {
+        self.peer
+    }
+
     /// The station to measure, newly chosen, if it changed: the one kept
     /// while it stays, else the first associated.
     pub fn choose(&mut self) -> Option<Heard> {

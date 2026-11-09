@@ -1,7 +1,9 @@
 //! How gPTP stands, written to a status file to read with `cat`, and for
 //! avb-bridged, which takes each port's asCapable from it: the first line
 //! names this process, and under `ports` a port's line has `up,
-//! asCapable` or `up, not asCapable` after its name, or `down`.
+//! asCapable` or `up, not asCapable` after its name, or `down`; an
+//! 802.11 port's names its station, which a beacon carrier leaves the
+//! port's Announce to.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -81,6 +83,9 @@ pub(crate) fn text(daemon: &Daemon) -> String {
             },
             role(relay.role(number).unwrap_or(Role::Disabled))
         );
+        if let Some(station) = port.wifi.as_ref().and_then(|wifi| wifi.peer()) {
+            let _ = write!(text, ", station {station}");
+        }
         if let Some(link) = relay.link(number) {
             let _ = write!(
                 text,
