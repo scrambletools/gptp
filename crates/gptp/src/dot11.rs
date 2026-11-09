@@ -237,18 +237,19 @@ struct Sent {
 }
 
 /// The frame a new one follows up: its dialog token, when it left and
-/// when its Ack came back on the port clock, and its Follow_Up.
+/// when its Ack came back on the port clock, and its Follow_Up if known.
 #[derive(Debug, Clone, Copy)]
 struct Previous {
     token: u8,
     departure: i128,
     ack_arrival: i128,
-    follow_up: [u8; FOLLOW_UP_LENGTH],
+    follow_up: Option<[u8; FOLLOW_UP_LENGTH]>,
 }
 
 /// The frames a timetransmitter sent a station, each new one carrying the
-/// times and Follow_Up of the last one both are known for: Timing
-/// Measurement's and Fine Timing Measurement's alike.
+/// times and Follow_Up of the last one both are known for, or for FTM the
+/// times alone where its Follow_Up is not: a station ranging only still
+/// measures.
 #[derive(Debug, Clone, Default)]
 struct Chain {
     last_token: u8,
@@ -260,23 +261,23 @@ impl Chain {
         self.sent.clear();
     }
 
-    /// A new frame's dialog token, and the frame it follows up, if any.
-    fn next(&mut self) -> (u8, Option<Previous>) {
+    /// A new frame's dialog token, and the frame it follows up, if any:
+    /// the last whose times are known, and with `needs_follow_up` whose
+    /// Follow_Up is too.
+    fn next(&mut self, needs_follow_up: bool) -> (u8, Option<Previous>) {
         self.last_token = self.last_token.wrapping_add(1).max(1);
         let mut previous = None;
-        let complete = self
-            .sent
-            .iter()
-            .rposition(|sent| sent.times.is_some() && sent.follow_up.is_some());
+        let complete = self.sent.iter().rposition(|sent| {
+            sent.times.is_some() && (sent.follow_up.is_some() || !needs_follow_up)
+        });
         if let Some(index) = complete {
             let sent = self.sent[index];
-            if let (Some((departure, ack_arrival)), Some(follow_up)) = (sent.times, sent.follow_up)
-            {
+            if let Some((departure, ack_arrival)) = sent.times {
                 previous = Some(Previous {
                     token: sent.token,
                     departure,
                     ack_arrival,
-                    follow_up,
+                    follow_up: sent.follow_up,
                 });
             }
             self.sent.drain(..=index);
@@ -330,7 +331,7 @@ impl Transmitter {
     /// [`confirmed`](Self::confirmed) and [`set_follow_up`](Self::set_follow_up)
     /// take back.
     pub fn next_frame(&mut self) -> TimingMeasurement {
-        let (token, previous) = self.chain.next();
+        let (token, previous) = self.chain.next(true);
         TimingMeasurement {
             dialog_token: token,
             follow_up_dialog_token: previous.map_or(0, |previous| previous.token),
@@ -338,7 +339,7 @@ impl Transmitter {
             toa: previous.map_or(0, |previous| ticks(previous.ack_arrival)),
             max_tod_error: 0,
             max_toa_error: 0,
-            follow_up: previous.map(|previous| previous.follow_up),
+            follow_up: previous.and_then(|previous| previous.follow_up),
         }
     }
 

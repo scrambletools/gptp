@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- gptp: the FTM responder follows up a frame with its times alone where
+  the relay has no Follow_Up for it yet, so a station that only ranges
+  still measures; Timing Measurement still waits for the Follow_Up. A
+  station asking no Min Delta FTM gets its frames spaced to fit the
+  burst it asked for, not 20 ms apart, which held 2 of the 8 an ESP32
+  asks for in 32 ms.
 - gptp: `dot11`, gPTP over 802.11 links (802.1AS-2020 clause 12):
   Timing Measurement and Fine Timing Measurement frames carrying the
   Follow_Up element of 12.7, both ends of each exchange, and

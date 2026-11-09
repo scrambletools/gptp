@@ -296,17 +296,23 @@ fn picoseconds_between(earlier: u64, later: u64) -> i128 {
 /// possible, with a burst length and spacing where the station has no
 /// preference, and every frame stamped from the first (ASAP capable).
 fn grant(asked: &FtmParameters) -> FtmParameters {
+    let burst_duration = if asked.burst_length().is_some() {
+        asked.burst_duration
+    } else {
+        LONGEST_BURST
+    };
+    let ftms_per_burst = if asked.ftms_per_burst == 0 {
+        FRAMES_FIRST
+    } else {
+        asked.ftms_per_burst
+    };
     FtmParameters {
         status: STATUS_SUCCESSFUL,
         value: 0,
         bursts_exponent: 0,
-        burst_duration: if asked.burst_length().is_some() {
-            asked.burst_duration
-        } else {
-            LONGEST_BURST
-        },
+        burst_duration,
         min_delta: if asked.min_delta == 0 {
-            SLOWEST_MIN_DELTA
+            fitting_min_delta(burst_duration, ftms_per_burst)
         } else {
             asked.min_delta
         },
@@ -316,11 +322,7 @@ fn grant(asked: &FtmParameters) -> FtmParameters {
         partial_tsf_no_preference: false,
         asap_capable: true,
         asap: true,
-        ftms_per_burst: if asked.ftms_per_burst == 0 {
-            FRAMES_FIRST
-        } else {
-            asked.ftms_per_burst
-        },
+        ftms_per_burst,
         format_and_bandwidth: if asked.format_and_bandwidth == 0 {
             FORMAT_NON_HT_20
         } else {
@@ -328,6 +330,15 @@ fn grant(asked: &FtmParameters) -> FtmParameters {
         },
         burst_period: 0,
     }
+}
+
+/// Min Delta FTM for a station with no preference, in 100 µs: the slowest
+/// sync's, or less where `frames` would not fit in the burst so spaced, as
+/// for a station asking 8 frames in 32 ms to range.
+fn fitting_min_delta(burst_duration: u8, frames: u8) -> u8 {
+    let burst = (250u32 << (burst_duration - 2)) / 100;
+    let spacing = burst / u32::from(frames.max(1));
+    spacing.clamp(1, u32::from(SLOWEST_MIN_DELTA)) as u8
 }
 
 /// A burst under way at the responder.
@@ -435,7 +446,7 @@ impl Responder {
 
     fn frame(&mut self, now: Duration) -> Option<FineTimingMeasurement> {
         let burst = self.burst.as_mut()?;
-        let (token, previous) = self.chain.next();
+        let (token, previous) = self.chain.next(false);
         // The last of the burst is followed up by none (802.1AS-2020
         // 12.5.1.4.5): it only carries the times of the one before.
         let last = burst.sent >= burst.granted.ftms_per_burst;
@@ -453,7 +464,7 @@ impl Responder {
             tod_error: 0,
             toa_error: 0,
             parameters: None,
-            follow_up: previous.map(|previous| previous.follow_up),
+            follow_up: previous.and_then(|previous| previous.follow_up),
         })
     }
 }

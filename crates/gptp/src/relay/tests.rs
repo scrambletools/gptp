@@ -1394,8 +1394,9 @@ fn an_802_11_port_answers_ftm_requests_with_the_grandmasters_time() {
     assert_eq!(bench.relay.role(2), Some(Role::TimeTransmitter));
 
     // Each frame but a burst's first carries the one before: when it left
-    // and its Ack came back, on the radio's clock in picoseconds, and its
-    // Follow_Up, saying the grandmaster's time then.
+    // and its Ack came back, on the radio's clock in picoseconds, and once
+    // the relay is synchronized its Follow_Up, saying the grandmaster's
+    // time then.
     let frames: Vec<(FineTimingMeasurement, i128)> = bench
         .actions_on(2, 0, is_measurement)
         .into_iter()
@@ -1407,6 +1408,7 @@ fn an_802_11_port_answers_ftm_requests_with_the_grandmasters_time() {
         })
         .collect();
     let mut checked = 0;
+    let mut synchronized = false;
     for (at, (frame, _)) in frames.iter().enumerate() {
         if frame.follow_up_dialog_token == 0 {
             continue;
@@ -1421,7 +1423,11 @@ fn an_802_11_port_answers_ftm_requests_with_the_grandmasters_time() {
             frame.toa,
             picoseconds(bench.stamp(2, left + 2 * AIR + SIFS).port)
         );
-        let message = frame.follow_up_message().expect("a Follow_Up");
+        let Some(message) = frame.follow_up_message() else {
+            assert!(!synchronized, "a Follow_Up missing once synchronized");
+            continue;
+        };
+        synchronized = true;
         let Body::FollowUp { precise_origin } = message.body else {
             panic!("not a Follow_Up");
         };

@@ -25,21 +25,6 @@ use raw_ether::wifi::{Event, Radio};
 /// How long to wait for the radio when no frame is due.
 const IDLE_WAIT: Duration = Duration::from_millis(500);
 
-/// A ranging station's request, with no Min Delta FTM, as one the burst
-/// can hold: the responder would space the frames 20 ms apart, the
-/// slowest gPTP sync's, and most would fall past a short burst's end.
-fn fitted(mut request: FtmRequest) -> FtmRequest {
-    if let Some(asked) = request.parameters.as_mut()
-        && asked.min_delta == 0
-        && asked.ftms_per_burst > 0
-        && let Some(length) = asked.burst_length()
-    {
-        let spacing = length.as_micros() / 100 / u128::from(asked.ftms_per_burst);
-        asked.min_delta = spacing.clamp(1, 255) as u8;
-    }
-    request
-}
-
 fn main() {
     if let Err(error) = run() {
         eprintln!("ftm_answer: {error}");
@@ -104,28 +89,25 @@ fn run() -> Result<(), String> {
     let mut responder = Responder::new();
     // Frames sent whose status is still to come: their cookie and token.
     let mut pending: Vec<(u64, u8)> = Vec::new();
-    let send = |frame: &mut FineTimingMeasurement, pending: &mut Vec<(u64, u8)>| {
-        if !follow_up {
-            frame.follow_up = None;
+    let send = |frame: &FineTimingMeasurement, pending: &mut Vec<(u64, u8)>| match radio
+        .send_action(station, radio.address(), &frame.encode())
+    {
+        Ok(cookie) => {
+            println!(
+                "{:10.3} sent FTM {} following up {}, tod {} toa {} ps{}",
+                start.elapsed().as_secs_f64(),
+                frame.dialog_token,
+                frame.follow_up_dialog_token,
+                frame.tod,
+                frame.toa,
+                frame
+                    .parameters
+                    .map(|granted| format!(", granted {granted:?}"))
+                    .unwrap_or_default()
+            );
+            pending.push((cookie, frame.dialog_token));
         }
-        match radio.send_action(station, radio.address(), &frame.encode()) {
-            Ok(cookie) => {
-                println!(
-                    "{:10.3} sent FTM {} following up {}, tod {} toa {} ps{}",
-                    start.elapsed().as_secs_f64(),
-                    frame.dialog_token,
-                    frame.follow_up_dialog_token,
-                    frame.tod,
-                    frame.toa,
-                    frame
-                        .parameters
-                        .map(|granted| format!(", granted {granted:?}"))
-                        .unwrap_or_default()
-                );
-                pending.push((cookie, frame.dialog_token));
-            }
-            Err(error) => println!("sending FTM {}: {error}", frame.dialog_token),
-        }
+        Err(error) => println!("sending FTM {}: {error}", frame.dialog_token),
     };
     loop {
         let timeout = responder
@@ -149,9 +131,8 @@ fn run() -> Result<(), String> {
                                     .map(|asked| format!(", asking {asked:?}"))
                                     .unwrap_or_default()
                             );
-                            let request = fitted(request);
-                            if let Some(mut frame) = responder.request(start.elapsed(), &request) {
-                                send(&mut frame, &mut pending);
+                            if let Some(frame) = responder.request(start.elapsed(), &request) {
+                                send(&frame, &mut pending);
                             }
                         }
                         Err(error) => println!("an FTM Request not understood: {error:?}"),
@@ -179,9 +160,9 @@ fn run() -> Result<(), String> {
                     if let (true, Some(departure), Some(ack_arrival)) = (acked, sent, ack_received)
                     {
                         responder.confirmed(token, departure, ack_arrival + bias_ns);
-                        // The responder follows up only frames with a
-                        // Follow_Up; with none to carry, a blank one.
-                        responder.set_follow_up(token, &[0; FOLLOW_UP_LENGTH]);
+                        if follow_up {
+                            responder.set_follow_up(token, &[0; FOLLOW_UP_LENGTH]);
+                        }
                     }
                 }
                 Event::Station { peer, joined } => {
@@ -199,8 +180,8 @@ fn run() -> Result<(), String> {
                 }
             }
         }
-        if let Some(mut frame) = responder.poll_frame(start.elapsed()) {
-            send(&mut frame, &mut pending);
+        if let Some(frame) = responder.poll_frame(start.elapsed()) {
+            send(&frame, &mut pending);
         }
     }
 }

@@ -160,6 +160,21 @@ fn a_frame_carries_the_last_one_complete() {
     assert_eq!(fourth.follow_up_dialog_token, third.dialog_token);
 }
 
+#[test]
+fn a_timing_measurement_waits_for_its_follow_up() {
+    let mut transmitter = Transmitter::new();
+    let first = transmitter.next_frame();
+    transmitter.confirmed(first.dialog_token, 1_000_005, 1_016_515);
+    // Its times alone are of no use to gPTP: the second frame goes without.
+    let second = transmitter.next_frame();
+    assert_eq!(second.follow_up_dialog_token, 0);
+    assert_eq!(second.follow_up, None);
+    transmitter.set_follow_up(first.dialog_token, &follow_up(1, 0));
+    let third = transmitter.next_frame();
+    assert_eq!(third.follow_up_dialog_token, first.dialog_token);
+    assert_eq!(third.follow_up, Some(follow_up(1, 0)));
+}
+
 /// Two radios: the transmitter's clock runs at `rate` times the
 /// receiver's from `offset`; a frame takes `delay` over the air and the
 /// receiver acks it `turnaround` after it arrives, in nanoseconds of the

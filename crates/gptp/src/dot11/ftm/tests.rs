@@ -179,6 +179,54 @@ fn the_responder_paces_a_burst_and_ends_it_with_token_zero() {
 }
 
 #[test]
+fn a_frame_without_its_follow_up_is_followed_up_by_its_times_alone() {
+    let mut responder = Responder::new();
+    let start = Duration::from_secs(1);
+    let initial = responder
+        .request(
+            start,
+            &FtmRequest {
+                trigger: 1,
+                parameters: Some(FtmParameters::for_sync(-2, 3)),
+            },
+        )
+        .expect("the initial frame");
+    // Not synchronized, the relay has no Follow_Up for it: a station that
+    // only ranges still gets its times.
+    responder.confirmed(initial.dialog_token, 1_000_000, 1_016_100);
+    let second = responder
+        .poll_frame(start + Duration::from_millis(20))
+        .expect("the second frame");
+    assert_eq!(second.follow_up_dialog_token, initial.dialog_token);
+    assert_eq!(second.tod, 1_000_000_000);
+    assert_eq!(second.toa, 1_016_100_000);
+    assert_eq!(second.follow_up, None);
+}
+
+#[test]
+fn a_station_with_no_spacing_gets_one_its_burst_holds() {
+    let asking = |burst_duration, ftms_per_burst| FtmParameters {
+        burst_duration,
+        min_delta: 0,
+        ftms_per_burst,
+        partial_tsf_no_preference: true,
+        format_and_bandwidth: FORMAT_NON_HT_20,
+        ..FtmParameters::default()
+    };
+    // 8 frames in 32 ms, as an ESP32 ranging asks: 4 ms apart, not 20.
+    let ranging = grant(&asking(9, 8));
+    assert_eq!(ranging.min_delta, 40);
+    assert_eq!(ranging.ftms_per_burst, 8);
+    // A burst of no preference, 128 ms, holds 3 frames 20 ms apart.
+    let unspecified = grant(&asking(15, 0));
+    assert_eq!(unspecified.burst_duration, 11);
+    assert_eq!(unspecified.min_delta, 200);
+    assert_eq!(unspecified.ftms_per_burst, 3);
+    // As short as can be: 250 µs for 2 frames, 100 µs apart at the least.
+    assert_eq!(grant(&asking(2, 2)).min_delta, 1);
+}
+
+#[test]
 fn an_unacked_frame_ends_the_burst_at_its_length() {
     let mut responder = Responder::new();
     let start = Duration::from_secs(1);
