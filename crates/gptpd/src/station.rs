@@ -1,9 +1,11 @@
 //! An end station's time for applications: the grandmaster's time against
 //! the port's hardware clock and against CLOCK_MONOTONIC, written to
 //! `/run/gptpd/<interface>.time` (gptp::time) at each comparison and each
-//! Sync. Nothing moves the hardware clock, so the mapping carries what a
-//! servo would have: offset and rate, and a new generation at each
-//! discontinuity.
+//! Sync. Nothing moves the hardware clock for the grandmaster's time, so
+//! the mapping carries what a servo would have: offset and rate, and a
+//! new generation at each discontinuity. Where the clock follows CLOCK_TAI
+//! (steer.rs), the station compares the free clock, the hardware clock
+//! less the steering, and the record goes back to the hardware clock.
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
@@ -15,6 +17,8 @@ use std::time::Duration;
 use gptp::ClockIdentity;
 use gptp::time::{Mapping, State};
 use raw_ether::clock::{Comparison, HardwareClock, Reading, SystemClock};
+
+use crate::steer::Steering;
 
 /// How far a comparison against the raw clock may stand from what the
 /// last ones foretold before the hardware clock is taken to have jumped,
@@ -248,26 +252,53 @@ impl Station {
         Ok(None)
     }
 
-    /// Compares the hardware clock with the system's once more.
-    pub fn compare(&mut self, clock: &HardwareClock) -> io::Result<Found> {
+    /// How much faster the hardware clock, or the free clock where it is
+    /// steered, runs than CLOCK_MONOTONIC, as a fraction, once compared
+    /// enough to tell.
+    pub fn drift(&self) -> Option<f64> {
+        self.monotonic.rate()
+    }
+
+    /// Compares the hardware clock with the system's once more, through
+    /// its `steering`, where it follows CLOCK_TAI, as the free clock.
+    pub fn compare(
+        &mut self,
+        clock: &HardwareClock,
+        steering: Option<&Steering>,
+    ) -> io::Result<Found> {
         let suspended = raw_ether::clock::suspended();
         if suspended.saturating_sub(self.suspended) > RESUMED {
             self.suspended = suspended;
             self.restart();
             return Ok(Found::Resumed);
         }
-        let at = clock.now()?.as_nanos() as i128;
+        let hardware = clock.now()?.as_nanos() as i128;
+        // On the free clock: the hardware clock less what steering added,
+        // which an offset read against a system clock carries too, as the
+        // steering stood at that reading: the hardware clock's time then is
+        // the system clock's just after it, and the offset.
+        let at = steering.map_or(hardware, |steering| steering.free(hardware));
+        let free = |offset: i128, system: SystemClock| match steering {
+            Some(steering) => {
+                let then = raw_ether::clock::system_now(system).as_nanos() as i128 + offset;
+                offset - (then - steering.free(then))
+            }
+            None => offset,
+        };
         let jump = if self.tight { JUMP_TIGHT } else { JUMP_READ };
         let mut found = Found::Steady;
         // A slow reading counts towards neither line nor a jump: the next
         // comparison, 100 ms on, tells a clock that was set.
         if let Some(raw) = self.offset(clock, SystemClock::MonotonicRaw)? {
+            let raw = free(raw, SystemClock::MonotonicRaw);
             if let Some(moved) = moved(&self.raw, at, raw)
                 && moved.abs() > jump
             {
                 // Read again, to tell a clock that was set from one
                 // misread.
-                let again = self.offset(clock, SystemClock::MonotonicRaw)?;
+                let again = self
+                    .offset(clock, SystemClock::MonotonicRaw)?
+                    .map(|again| free(again, SystemClock::MonotonicRaw));
                 if again.is_none_or(|again| (again - raw).abs() > jump / 2) {
                     return Ok(Found::Steady);
                 }
@@ -278,7 +309,7 @@ impl Station {
             self.raw.update(at, raw);
         }
         if let Some(monotonic) = self.offset(clock, SystemClock::Monotonic)? {
-            self.follow_monotonic(at, monotonic);
+            self.follow_monotonic(at, free(monotonic, SystemClock::Monotonic));
         }
         Ok(found)
     }
@@ -462,6 +493,7 @@ impl Station {
             local_rate: 1.0,
             asymmetry_included: view.asymmetry_included,
             residual: self.residual,
+            tai: None,
         };
         if let (Some(_), Some(((local, at_local, local_rate), slope))) = (view.grandmaster, line) {
             if view.ours {
@@ -496,10 +528,11 @@ impl Station {
         mapping
     }
 
-    /// Writes `mapping` over the record, whole.
-    pub fn write(&mut self, mapping: Mapping) -> io::Result<()> {
+    /// Writes `mapping` over the record, whole, as `recorded`: the same
+    /// on the hardware clock where it is steered.
+    pub fn write(&mut self, mapping: Mapping, recorded: Mapping) -> io::Result<()> {
         self.sequence = self.sequence.wrapping_add(1);
-        self.file.write_all_at(&mapping.encode(self.sequence), 0)?;
+        self.file.write_all_at(&recorded.encode(self.sequence), 0)?;
         self.written = Some(mapping);
         Ok(())
     }
@@ -634,6 +667,7 @@ mod tests {
             local_rate,
             asymmetry_included: false,
             residual: None,
+            tai: None,
         }
     }
 
@@ -690,7 +724,7 @@ mod tests {
 
     fn published(station: &mut Station, view: View, now: i64) -> Mapping {
         let mapping = station.mapping(view, now);
-        station.write(mapping).expect("written");
+        station.write(mapping, mapping).expect("written");
         mapping
     }
 
@@ -1046,6 +1080,7 @@ mod tests {
             local_rate,
             asymmetry_included: false,
             residual: None,
+            tai: None,
         };
         for later in [1_000_000_000_i128, 60_000_000_000] {
             let monotonic = at_monotonic0 + later;

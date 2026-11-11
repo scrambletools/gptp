@@ -53,6 +53,12 @@ pub struct Mapping {
     /// How far the last Sync's time was from the mapping, in nanoseconds:
     /// the mapping's residual, not a servo's offset.
     pub residual: Option<i64>,
+    /// How far the hardware clock stood from CLOCK_TAI at gptpd's last
+    /// comparison, in nanoseconds, where gptpd keeps it there: a card that
+    /// sends a frame when its clock reaches the frame's launch time, as
+    /// the ETF queue discipline sets it on CLOCK_TAI, sends it on time.
+    /// None where the clock does not follow CLOCK_TAI.
+    pub tai: Option<i16>,
 }
 
 impl Mapping {
@@ -108,7 +114,11 @@ impl Mapping {
             State::Following => 1,
             State::Grandmaster => 2,
         };
-        record[17] = u8::from(self.asymmetry_included) | u8::from(self.residual.is_some()) << 1;
+        record[17] = u8::from(self.asymmetry_included)
+            | u8::from(self.residual.is_some()) << 1
+            | u8::from(self.tai.is_some()) << 2;
+        // Two octets a reader of an earlier record took for padding.
+        record[18..20].copy_from_slice(&self.tai.unwrap_or(0).to_le_bytes());
         record[20..28].copy_from_slice(&self.grandmaster.0.to_le_bytes());
         record[28..36].copy_from_slice(&self.updated.to_le_bytes());
         record[36..44].copy_from_slice(&self.monotonic.to_le_bytes());
@@ -165,6 +175,7 @@ impl Mapping {
             local_rate: f64::from_le_bytes(array(&record[100..108])),
             asymmetry_included: record[17] & 1 != 0,
             residual: (record[17] & 2 != 0).then(|| i64::from_le_bytes(array(&record[108..116]))),
+            tai: (record[17] & 4 != 0).then(|| i16::from_le_bytes([record[18], record[19]])),
         };
         Ok((mapping, u32::from_le_bytes(array(&record[8..12]))))
     }

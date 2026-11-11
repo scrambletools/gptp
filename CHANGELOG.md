@@ -38,6 +38,19 @@
   frame the next one's time. A distrusted Pdelay exchange is left out of
   the delay and the rate, up to `ALLOWED_DISTRUSTED_EXCHANGES` in a row,
   and a distrusted Sync's time is not taken.
+- gptpd: `follow-tai yes` keeps an end station's hardware clock near
+  CLOCK_TAI, slewing its rate a little after each comparison and setting
+  it only at a start, after its driver reset it or when CLOCK_TAI
+  stepped, never as grandmaster, so a card that sends frames at launch
+  times on it (ETF offload) sends them on time. gptpd's own model runs on
+  a free clock, the hardware clock less the steering, so its Pdelay,
+  lines, jump checks and generations go on as before; only the record
+  goes back to the hardware clock. No by default.
+- gptp 0.2.0: `time::Mapping::tai`, how far the hardware clock stands
+  from CLOCK_TAI where gptpd keeps it there, in two octets the record
+  had spare, so readers of version 1 records read it as before. A new
+  public field, so code that builds a Mapping changes.
+- raw-ether 0.1.1: `HardwareClock::step`.
 
 ## [0.1.0] - 2026-10-31
 

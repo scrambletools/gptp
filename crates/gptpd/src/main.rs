@@ -13,6 +13,7 @@ mod lite;
 mod server;
 mod station;
 mod status;
+mod steer;
 mod wifi;
 
 use std::os::fd::{AsFd, BorrowedFd};
@@ -28,7 +29,7 @@ use raw_ether::MacAddress;
 use raw_ether::interfaces::LinkChanges;
 use raw_ether::stamped::{self, StampedSocket};
 
-use crate::clocks::Clocks;
+use crate::clocks::{Clocks, Followed};
 use crate::lite::Lite;
 use crate::server::Server;
 use crate::station::{Found, Station, Steadying, View};
@@ -87,10 +88,13 @@ fn cold_time_base(clocks: &Clocks, utc_offset: i16) -> Result<TimeBase, String> 
         .offset_from_system_clock(SystemClock::Realtime)
         .or_else(|_| clock.offset_read_against(SystemClock::Realtime))
         .map_err(fail)?;
-    let local = clocks.now().map_err(fail)?;
+    // The wall clock's time from the hardware clock's own reading; the time
+    // base then stands at that reading on the free clock, where the
+    // hardware clock is steered.
+    let hardware = clock.now().map_err(fail)?.as_nanos() as i128;
     Ok(TimeBase {
-        local,
-        time: local - ahead + i128::from(utc_offset) * 1_000_000_000,
+        local: clocks.free(hardware),
+        time: hardware - ahead + i128::from(utc_offset) * 1_000_000_000,
         rate: 1.0,
     })
 }
@@ -768,10 +772,16 @@ impl Daemon {
             return;
         };
         let slow = end.station.slow();
-        match end.station.compare(self.clocks.local_clock()) {
+        match end
+            .station
+            .compare(self.clocks.local_clock(), self.clocks.steering())
+        {
             Ok(Found::Steady) => {}
             Ok(Found::Jumped(moved)) => {
                 self.changed = true;
+                // Set by its driver, or by the steering itself: the free
+                // clock starts afresh from it.
+                self.clocks.steering_reset();
                 eprintln!(
                     "{}: its clock moved {moved} ns against the system's; a new generation, {}",
                     self.ports[0].name,
@@ -823,6 +833,34 @@ impl Daemon {
                  line against CLOCK_MONOTONIC",
                 self.ports[0].name
             );
+        }
+        self.follow_tai();
+    }
+
+    /// Steers an end station's clock towards CLOCK_TAI, where it follows it,
+    /// after a comparison.
+    fn follow_tai(&mut self) {
+        if self.clocks.steering().is_none() {
+            return;
+        }
+        let grandmaster = self.view().ours;
+        let drift = self
+            .end_station
+            .as_ref()
+            .and_then(|end| end.station.drift());
+        let name = &self.ports[0].name;
+        match self.clocks.follow_tai(drift, grandmaster) {
+            Some(Followed::Set(by)) => {
+                eprintln!("{name}: its clock set {by} ns on, to CLOCK_TAI");
+            }
+            Some(Followed::Began(offset)) => {
+                eprintln!("{name}: its clock follows CLOCK_TAI, {offset} ns from it");
+            }
+            Some(Followed::Lost(offset)) => {
+                eprintln!("{name}: its clock no longer follows CLOCK_TAI, {offset} ns from it");
+            }
+            Some(Followed::Failed(why)) => eprintln!("{name}: steering its clock: {why}"),
+            None => {}
         }
     }
 
@@ -904,7 +942,8 @@ impl Daemon {
             return;
         };
         let mapping = end.station.mapping(view, monotonic);
-        if let Err(error) = end.station.write(mapping) {
+        let recorded = self.clocks.recorded(mapping);
+        if let Err(error) = end.station.write(mapping, recorded) {
             eprintln!("cannot write {}: {error}", end.station.path().display());
         }
         let name = &self.ports[0].name;
@@ -1043,7 +1082,23 @@ fn run(options: Options) -> Result<(), String> {
         .ok_or_else(|| format!("no interface named {named_by}"))?;
     let identity = identity_of(mac);
     let local = options.clock.as_ref().unwrap_or(&options.ports[0]);
-    let mut clocks = Clocks::open(&options.ports, local)?;
+    // An end station's settings come first: they say whether its clock
+    // follows CLOCK_TAI.
+    let station_settings = match options.station() {
+        Some(interface) => {
+            let config = options
+                .config
+                .clone()
+                .unwrap_or_else(|| config::path(interface));
+            let settings = config::load(&config)?;
+            Some((config, settings))
+        }
+        None => None,
+    };
+    let follow_tai = station_settings
+        .as_ref()
+        .is_some_and(|(_, settings)| settings.follow_tai);
+    let mut clocks = Clocks::open(&options.ports, local, follow_tai)?;
     clocks.compare();
     let interfaces = raw_ether::interfaces();
     let mut ports = Vec::new();
@@ -1063,25 +1118,25 @@ fn run(options: Options) -> Result<(), String> {
             wifi: None,
         });
     }
-    let end_station = match options.station() {
-        Some(interface) => {
-            let config = options
-                .config
-                .clone()
-                .unwrap_or_else(|| config::path(interface));
-            let settings = config::load(&config)?;
+    let end_station = match (options.station(), station_settings) {
+        (Some(interface), Some((config, settings))) => {
             let station = Station::open(interface, clocks.local_clock())?;
             let socket = gptp::status::path(interface).map_err(|error| error.to_string())?;
             let server =
                 Server::start(&socket).map_err(|error| format!("{}: {error}", socket.display()))?;
             eprintln!(
                 "an end station on {interface}, as clock {identity}, generation {}, \
-                 compared with the system's clocks {}",
+                 compared with the system's clocks {}{}",
                 station.generation(),
                 if station.tight() {
                     "by its driver"
                 } else {
                     "by reading both"
+                },
+                if clocks.steering().is_some() {
+                    ", its clock following CLOCK_TAI"
+                } else {
+                    ""
                 }
             );
             let lite = Lite::new(identity, settings.profile, Duration::ZERO);
@@ -1093,7 +1148,7 @@ fn run(options: Options) -> Result<(), String> {
                 lite,
             })
         }
-        None => {
+        _ => {
             eprintln!(
                 "a time-aware relay on {}, as clock {identity}, with {}'s hardware clock the \
                  LocalClock",
@@ -1122,6 +1177,9 @@ fn run(options: Options) -> Result<(), String> {
         let now = raw_ether::clock::monotonic_now().as_nanos() as i64;
         match end.station.earlier_line(now) {
             Some((local, time, rate)) => {
+                // Recorded on the hardware clock; the time base runs on
+                // the free one.
+                let (local, rate) = clocks.free_line(local, rate);
                 relay.set_time_base(TimeBase { local, time, rate });
                 eprintln!(
                     "priority1 {}: as grandmaster its time goes on from the last record's, \

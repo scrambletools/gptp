@@ -55,6 +55,12 @@ impl HardwareClock {
         self.inner.set_frequency_adjustment(ppb)
     }
 
+    /// Sets the clock `by` nanoseconds on, back where negative. Needs the
+    /// clock opened with [`open_adjustable`](Self::open_adjustable).
+    pub fn step(&self, by: i128) -> io::Result<()> {
+        self.inner.step(by)
+    }
+
     /// The clock's time, from the PTP epoch.
     pub fn now(&self) -> io::Result<Duration> {
         self.inner.now()
@@ -366,6 +372,21 @@ mod platform {
             .map(|_| ())
         }
 
+        pub fn step(&self, by: i128) -> io::Result<()> {
+            // SAFETY: timex is plain data, valid when zeroed.
+            let mut time: libc::timex = unsafe { std::mem::zeroed() };
+            // With ADJ_NANO, the offset's microseconds field holds
+            // nanoseconds, from 0 to a second.
+            time.modes = libc::ADJ_SETOFFSET | libc::ADJ_NANO;
+            time.time.tv_sec = by.div_euclid(1_000_000_000) as libc::time_t;
+            time.time.tv_usec = by.rem_euclid(1_000_000_000) as libc::suseconds_t;
+            // SAFETY: `time` is a valid timex that lives through the call.
+            if unsafe { libc::clock_adjtime(self.id, &raw mut time) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
         /// The clock less the system clock, from its driver's tightest of
         /// several readings between two of the system clock
         /// (PTP_SYS_OFFSET_EXTENDED), or unsupported where it has none.
@@ -487,6 +508,10 @@ mod platform {
         }
 
         pub fn set_frequency_adjustment(&self, _ppb: f64) -> io::Result<()> {
+            Err(unsupported())
+        }
+
+        pub fn step(&self, _by: i128) -> io::Result<()> {
             Err(unsupported())
         }
 

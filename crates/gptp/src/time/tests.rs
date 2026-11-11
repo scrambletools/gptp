@@ -14,6 +14,7 @@ fn mapping() -> Mapping {
         local_rate: 1.0 - 1.4e-6,
         asymmetry_included: true,
         residual: Some(-42),
+        tai: Some(-1_234),
     }
 }
 
@@ -25,6 +26,7 @@ fn a_record_decodes_as_it_was_encoded() {
     let none = Mapping {
         state: State::None,
         residual: None,
+        tai: None,
         asymmetry_included: false,
         ..mapping()
     };
@@ -185,4 +187,19 @@ mod reader {
             assert!(path(wrong).is_err(), "{wrong}");
         }
     }
+}
+
+#[test]
+fn a_reader_of_the_first_records_reads_one_that_says_how_far_tai_stands() {
+    // The TAI offset takes octets that were padding: the version, length
+    // and every other field stay where they were.
+    let record = mapping().encode(5);
+    assert_eq!(u16::from_le_bytes([record[4], record[5]]), 1);
+    assert_eq!(record.len(), 120);
+    let without = Mapping {
+        tai: None,
+        ..mapping()
+    }
+    .encode(5);
+    assert_eq!(record[20..116], without[20..116]);
 }

@@ -32,6 +32,9 @@ pub struct Settings {
     /// Whether the port says each second that it runs gPTP (802.1AS-2020
     /// 10.6.4.4).
     pub gptp_capable: bool,
+    /// Whether the port's hardware clock is kept near CLOCK_TAI, for cards
+    /// that send frames at launch times on it (steer.rs).
+    pub follow_tai: bool,
 }
 
 impl Default for Settings {
@@ -40,6 +43,7 @@ impl Default for Settings {
             priority1: PRIORITY1,
             profile: Profile::Auto,
             gptp_capable: true,
+            follow_tai: false,
         }
     }
 }
@@ -97,6 +101,18 @@ pub fn parse(text: &str) -> Result<Settings, String> {
                     _ => {
                         return Err(format!(
                             "line {}: gptp-capable takes yes or no, not {value:?}",
+                            number + 1
+                        ));
+                    }
+                };
+            }
+            "follow-tai" => {
+                settings.follow_tai = match value {
+                    "yes" => true,
+                    "no" => false,
+                    _ => {
+                        return Err(format!(
+                            "line {}: follow-tai takes yes or no, not {value:?}",
                             number + 1
                         ));
                     }
@@ -235,8 +251,11 @@ mod tests {
                 priority1: 255,
                 profile: Profile::AvbLite,
                 gptp_capable: true,
+                follow_tai: false,
             })
         );
+        assert!(parse("follow-tai yes").expect("settings").follow_tai);
+        assert!(parse("follow-tai 1").is_err());
         assert!(parse("profile 1588").is_err());
         assert!(!parse("gptp-capable no").expect("settings").gptp_capable);
         assert!(parse("priority1 0").is_err());

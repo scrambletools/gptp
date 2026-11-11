@@ -6,14 +6,23 @@
 //! relay's residence times. No clock is stepped or slewed for it: each
 //! runs free, with any frequency adjustment linuxptp left taken off as
 //! the daemon starts.
+//!
+//! An end station's clock may follow CLOCK_TAI instead (steer.rs): then
+//! its times go through the steering to the free clock gptpd's model runs
+//! on, and the record's line back to the hardware clock.
 
 use std::io;
 use std::time::Duration;
 
 use gptp::relay::Stamp;
-use raw_ether::clock::{Comparison, HardwareClock, Reading};
+use gptp::time::Mapping;
+use raw_ether::clock::{Comparison, HardwareClock, Reading, SystemClock};
 
 use crate::station::{SLOW_TIGHT, Spans};
+use crate::steer::{self, Change, Steering};
+
+/// How long a reading against CLOCK_TAI may take, in ns, and still steer.
+const SLOW_STEERING: u64 = 20_000;
 
 /// How far a comparison may stand from what the last ones foretold before
 /// the port's clock is taken to have been set, as its driver does when it
@@ -45,6 +54,24 @@ pub struct Clocks {
     local_name: String,
     local: HardwareClock,
     ports: Vec<PortClock>,
+    /// Where an end station's clock follows CLOCK_TAI.
+    steering: Option<Steering>,
+    following: bool,
+    /// How far the clock was set on as gptpd started, which an earlier
+    /// gptpd's record does not know.
+    set_at_start: i128,
+}
+
+/// What following CLOCK_TAI came to, worth saying.
+#[derive(Debug)]
+pub enum Followed {
+    /// The clock was set this many ns on.
+    Set(i128),
+    /// It came within reach of CLOCK_TAI, or left it, standing this many ns
+    /// from it.
+    Began(i128),
+    Lost(i128),
+    Failed(String),
 }
 
 /// An interface's hardware clock index.
@@ -71,12 +98,60 @@ fn open_free(interface: &str, index: u32) -> Result<HardwareClock, String> {
     Ok(clock)
 }
 
+/// Opens `interface`'s clock to steer near CLOCK_TAI, keeping the
+/// adjustment it has, from an earlier gptpd most likely, and setting it to
+/// CLOCK_TAI where it stands too far off to slew.
+/// Also how far it was set on, if at all.
+fn open_steered(interface: &str, index: u32) -> Result<(HardwareClock, Steering, i128), String> {
+    let fail = |error: io::Error| format!("{interface}'s clock: {error}");
+    let clock = HardwareClock::open_adjustable(index).map_err(fail)?;
+    let adjust = clock.frequency_adjustment().map_err(fail)?;
+    let offset = tai_offset(&clock).map_err(fail)?;
+    let mut set = 0;
+    if offset.abs() > steer::SET_BEYOND {
+        clock.step(-offset).map_err(fail)?;
+        set = -offset;
+        eprintln!("{interface}: its clock set {set} ns on, to CLOCK_TAI");
+    }
+    let now = clock.now().map_err(fail)?.as_nanos() as i128;
+    Ok((clock, Steering::new(now, adjust), set))
+}
+
+/// How far `clock` stands ahead of CLOCK_TAI, and how long the reading
+/// took.
+fn tai_reading(clock: &HardwareClock) -> io::Result<Reading> {
+    clock
+        .reading_from_system_clock(SystemClock::Tai)
+        .or_else(|_| clock.reading_against(SystemClock::Tai))
+}
+
+fn tai_offset(clock: &HardwareClock) -> io::Result<i128> {
+    tai_reading(clock).map(|reading| reading.offset)
+}
+
+/// `clock`'s time now, or where it cannot be read, CLOCK_TAI's and
+/// `offset`, how far the clock stood from it at the last reading: off by
+/// a few us at most, which the steering's few ppm make well under a ns.
+/// Once the clock was changed its bookkeeping must go on, read or not.
+fn hardware_now(clock: &HardwareClock, offset: i128) -> i128 {
+    clock.now().map_or_else(
+        |_| raw_ether::clock::system_now(SystemClock::Tai).as_nanos() as i128 + offset,
+        |now| now.as_nanos() as i128,
+    )
+}
+
 impl Clocks {
-    /// The clocks of `ports`, with `local`'s the LocalClock.
-    pub fn open(ports: &[String], local: &str) -> Result<Self, String> {
+    /// The clocks of `ports`, with `local`'s the LocalClock, which follows
+    /// CLOCK_TAI where `follow_tai` asks, on an end station.
+    pub fn open(ports: &[String], local: &str, follow_tai: bool) -> Result<Self, String> {
         let local_index = index_of(local)?;
         let mut freed = vec![local_index];
-        let local_clock = open_free(local, local_index)?;
+        let (local_clock, steering, set_at_start) = if follow_tai && ports.len() == 1 {
+            let (clock, steering, set) = open_steered(local, local_index)?;
+            (clock, Some(steering), set)
+        } else {
+            (open_free(local, local_index)?, None, 0)
+        };
         let mut clocks = Vec::new();
         for name in ports {
             let index = index_of(name)?;
@@ -107,6 +182,9 @@ impl Clocks {
             local_name: local.to_owned(),
             local: local_clock,
             ports: clocks,
+            steering,
+            following: false,
+            set_at_start,
         })
     }
 
@@ -119,9 +197,120 @@ impl Clocks {
         &self.local
     }
 
-    /// The LocalClock's time, in nanoseconds.
+    /// The LocalClock's time, in nanoseconds, on the free clock where it
+    /// is steered.
     pub fn now(&self) -> io::Result<i128> {
-        Ok(self.local.now()?.as_nanos() as i128)
+        Ok(self.free(self.local.now()?.as_nanos() as i128))
+    }
+
+    /// The free clock's time at the LocalClock's `hardware`.
+    pub fn free(&self, hardware: i128) -> i128 {
+        self.steering
+            .as_ref()
+            .map_or(hardware, |steering| steering.free(hardware))
+    }
+
+    /// The LocalClock's steering, where it follows CLOCK_TAI.
+    pub fn steering(&self) -> Option<&Steering> {
+        self.steering.as_ref()
+    }
+
+    /// Steers the LocalClock after a comparison, the free clock running
+    /// `drift` faster than CLOCK_MONOTONIC, where known; left alone while
+    /// this system is grandmaster.
+    pub fn follow_tai(&mut self, drift: Option<f64>, grandmaster: bool) -> Option<Followed> {
+        let steering = self.steering.as_mut()?;
+        let reading = match tai_reading(&self.local) {
+            Ok(reading) => reading,
+            Err(error) => {
+                return Some(Followed::Failed(format!(
+                    "reading against CLOCK_TAI: {error}"
+                )));
+            }
+        };
+        if reading.span > SLOW_STEERING {
+            return None;
+        }
+        let said = match steering.follow(reading.offset, drift, grandmaster) {
+            Change::None => None,
+            Change::Adjust(adjust) => {
+                if let Err(error) = self.local.set_frequency_adjustment(adjust) {
+                    return Some(Followed::Failed(format!(
+                        "adjusting its frequency: {error}"
+                    )));
+                }
+                // The change took from about now: what it moved before the
+                // reading below is a few us at the change's few ppb, well
+                // under a ns.
+                steering.changed(hardware_now(&self.local, reading.offset), adjust);
+                None
+            }
+            Change::Set(by) => {
+                if let Err(error) = self.local.step(by) {
+                    return Some(Followed::Failed(format!("setting it: {error}")));
+                }
+                let at = hardware_now(&self.local, reading.offset + by);
+                steering.restart(at, steering.adjust());
+                Some(Followed::Set(by))
+            }
+        };
+        let following = steering.following();
+        if following.is_some() != self.following {
+            self.following = following.is_some();
+            return Some(match following {
+                Some(offset) => Followed::Began(offset),
+                None => Followed::Lost(reading.offset),
+            });
+        }
+        said
+    }
+
+    /// After the LocalClock was set by something else, as its driver does
+    /// when it resets the card: puts the adjustment back, which the reset
+    /// may have dropped, and starts the free clock afresh from it.
+    pub fn steering_reset(&mut self) {
+        let Some(steering) = &mut self.steering else {
+            return;
+        };
+        let _ = self.local.set_frequency_adjustment(steering.adjust());
+        let offset = tai_offset(&self.local).unwrap_or(0);
+        steering.restart(hardware_now(&self.local, offset), steering.adjust());
+        self.following = false;
+    }
+
+    /// `mapping` as the record carries it: its line on the hardware clock
+    /// the card launches frames by, not the free one, and how far that
+    /// stands from CLOCK_TAI where it follows it.
+    pub fn recorded(&self, mapping: Mapping) -> Mapping {
+        let Some(steering) = &self.steering else {
+            return mapping;
+        };
+        let (local, at_local, local_rate) =
+            steering.hardware_line(mapping.local, mapping.at_local, mapping.local_rate);
+        Mapping {
+            local,
+            at_local,
+            local_rate,
+            tai: steering
+                .following()
+                .map(|offset| offset.clamp(i16::MIN.into(), i16::MAX.into()) as i16),
+            ..mapping
+        }
+    }
+
+    /// A line of the grandmaster's time on the hardware clock, as an earlier
+    /// gptpd recorded it, on the free clock: its point and rate.
+    pub fn free_line(&self, local: i128, rate: f64) -> (i128, f64) {
+        // A clock set on as gptpd started reads that much more at the same
+        // instant.
+        let local = local + self.set_at_start;
+        match &self.steering {
+            Some(steering) => {
+                let free = steering.free(local);
+                (free, rate * steering.rate_at(free))
+            }
+            None => (local, rate),
+        }
     }
 
     /// Compares each port's clock with the LocalClock once more.
@@ -186,7 +375,7 @@ impl Clocks {
                 local: time - comparison.offset_at(time),
                 rate: rate_over_local(comparison),
             },
-            _ => Stamp::local(time),
+            _ => Stamp::local(self.free(time)),
         }
     }
 

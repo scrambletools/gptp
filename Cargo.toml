@@ -12,8 +12,8 @@ readme = "README.md"
 [workspace.dependencies]
 # The protocol crate depends on nothing, and builds without std when its
 # default feature is off; raw-ether is the daemon's platform code.
-gptp = { path = "crates/gptp", version = "0.1.0" }
-raw-ether = { path = "crates/raw-ether", version = "0.1.0" }
+gptp = { path = "crates/gptp", version = "0.2.0" }
+raw-ether = { path = "crates/raw-ether", version = "0.1.1" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
