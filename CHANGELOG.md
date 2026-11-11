@@ -55,6 +55,11 @@
   associated. nl80211 tells of a new station at authentication, before
   hostapd has its extended capabilities, and gptpd took it for one that
   measures neither way until it left.
+- gptpd counts the event messages it leaves out for coming without a
+  time stamp, in its log and status. At a Sync timeout it tells the
+  port's frames of the last second: how long after the last of its type
+  the card stamped each one received, each Pdelay_Resp's turnaround,
+  and the stamps sent that never came back.
 
 ## [0.1.0] - 2026-10-31
 

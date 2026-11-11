@@ -98,6 +98,13 @@ pub(crate) fn text(daemon: &Daemon) -> String {
         if let Some(rate) = daemon.clocks.rate(index) {
             let _ = write!(text, ", its clock {} from the LocalClock", ppm(rate));
         }
+        if port.unstamped > 0 {
+            let _ = write!(
+                text,
+                ", {} event messages without a time stamp",
+                port.unstamped
+            );
+        }
         text.push('\n');
     }
     text

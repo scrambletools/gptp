@@ -16,6 +16,7 @@ mod status;
 mod steer;
 mod wifi;
 
+use std::collections::VecDeque;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -54,6 +55,13 @@ const STATUS_EVERY: Duration = Duration::from_secs(1);
 /// How long a port may take to say when a frame went out: igc can take a
 /// few ms.
 const STAMP_WAIT: Duration = Duration::from_millis(20);
+
+/// How many frames a wired port remembers, both ways together, to show
+/// what came before a Sync timeout: two seconds' worth or more.
+const REMEMBERED: usize = 64;
+
+/// How far back a Sync timeout shows the frames its port handled.
+const SHOWN_BEFORE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The exit status of `--check` when another PTP daemon holds the
 /// interface, for the unit's RestartPreventExitStatus=.
@@ -215,11 +223,175 @@ struct Port {
     stamps_every_frame: bool,
     /// Times left out, the frame after them having come without one.
     distrusted: u64,
+    /// Event messages left out for having come without a time stamp.
+    unstamped: u64,
+    /// Syncs that came without a time stamp since the last that came
+    /// with one, and the sequence ID of the latest.
+    unstamped_syncs: u64,
+    last_unstamped_sync: u16,
+    /// The last frames a wired port handled, oldest first.
+    seen: VecDeque<Seen>,
     /// Whether the port is an 802.11 port.
     wireless: bool,
     /// An 802.11 port's radio, whose Action frames carry the timing,
     /// opened while the port is up.
     wifi: Option<WifiPort>,
+}
+
+/// A gPTP frame a wired port received or sent, as remembered.
+#[derive(Clone, Copy)]
+struct Seen {
+    /// When the daemon handled it.
+    at: Duration,
+    sent: bool,
+    /// The low nibble of its first octet.
+    message_type: Option<u8>,
+    sequence: Option<u16>,
+    stamping: Stamping,
+}
+
+/// What became of a remembered frame's time stamp.
+#[derive(Clone, Copy)]
+enum Stamping {
+    /// Received, stamped this time by the card.
+    Came(Duration),
+    Missing,
+    NotAsked,
+    Waiting,
+    /// Sent, its time stamp back `wait` after, stamped `wire` by the card.
+    Back {
+        wait: Duration,
+        wire: Duration,
+    },
+    NeverCame,
+}
+
+/// What a remembered frame shows beside itself, from the frames around it.
+#[derive(Clone, Copy, Default)]
+struct Beside {
+    /// For one received, how long after the last of its type the card
+    /// stamped it, in nanoseconds.
+    wire_gap: Option<i128>,
+    /// For a Pdelay_Resp sent, t3 less t2 on the card's stamps, in
+    /// nanoseconds.
+    turnaround: Option<i128>,
+}
+
+impl Seen {
+    /// The frame, `now` being the daemon's time.
+    fn describe(&self, now: Duration, beside: Beside) -> String {
+        let ago = now.saturating_sub(self.at).as_secs_f64() * 1e3;
+        let sequence = self
+            .sequence
+            .map_or_else(|| "?".to_owned(), |sequence| sequence.to_string());
+        let stamp = match self.stamping {
+            Stamping::Came(_) => match beside.wire_gap {
+                Some(gap) => format!(
+                    ", stamped {:.3} ms after the {} before",
+                    gap as f64 / 1e6,
+                    type_name(self.message_type)
+                ),
+                None => ", stamped".to_owned(),
+            },
+            Stamping::Missing => ", without a time stamp".to_owned(),
+            Stamping::NotAsked => String::new(),
+            Stamping::Waiting => ", its time stamp not back yet".to_owned(),
+            Stamping::Back { wait, .. } => {
+                let mut told = format!(
+                    ", its time stamp back after {:.3} ms",
+                    wait.as_secs_f64() * 1e3
+                );
+                if let Some(turnaround) = beside.turnaround {
+                    told.push_str(&format!(", turnaround {:.3} us", turnaround as f64 / 1e3));
+                }
+                told
+            }
+            Stamping::NeverCame => ", its time stamp never came".to_owned(),
+        };
+        format!(
+            "{ago:.1} ms before, {} {} {sequence}{stamp}",
+            if self.sent { "sent" } else { "received" },
+            type_name(self.message_type)
+        )
+    }
+}
+
+/// A gPTP frame's message type and sequence ID, read from the header
+/// octets so that a frame that would not decode still shows.
+fn header(frame: &[u8]) -> (Option<u8>, Option<u16>) {
+    let message_type = frame.first().map(|octet| octet & 0x0f);
+    let sequence = frame
+        .get(30..32)
+        .map(|octets| u16::from_be_bytes([octets[0], octets[1]]));
+    (message_type, sequence)
+}
+
+/// A message type's name, as the standard spells it.
+fn type_name(message_type: Option<u8>) -> &'static str {
+    const SYNC: u8 = MessageType::Sync as u8;
+    const DELAY_REQ: u8 = MessageType::DelayReq as u8;
+    const PDELAY_REQ: u8 = MessageType::PdelayReq as u8;
+    const PDELAY_RESP: u8 = MessageType::PdelayResp as u8;
+    const FOLLOW_UP: u8 = MessageType::FollowUp as u8;
+    const DELAY_RESP: u8 = MessageType::DelayResp as u8;
+    const PDELAY_RESP_FOLLOW_UP: u8 = MessageType::PdelayRespFollowUp as u8;
+    const ANNOUNCE: u8 = MessageType::Announce as u8;
+    const SIGNALING: u8 = MessageType::Signaling as u8;
+    match message_type {
+        Some(SYNC) => "Sync",
+        Some(DELAY_REQ) => "Delay_Req",
+        Some(PDELAY_REQ) => "Pdelay_Req",
+        Some(PDELAY_RESP) => "Pdelay_Resp",
+        Some(FOLLOW_UP) => "Follow_Up",
+        Some(DELAY_RESP) => "Delay_Resp",
+        Some(PDELAY_RESP_FOLLOW_UP) => "Pdelay_Resp_Follow_Up",
+        Some(ANNOUNCE) => "Announce",
+        Some(SIGNALING) => "Signaling",
+        _ => "message",
+    }
+}
+
+impl Port {
+    /// Remembers a frame a wired port handled, forgetting the oldest.
+    fn remember(&mut self, at: Duration, frame: &[u8], sent: bool, stamping: Stamping) {
+        if self.wireless {
+            return;
+        }
+        if self.seen.len() >= REMEMBERED {
+            self.seen.pop_front();
+        }
+        let (message_type, sequence) = header(frame);
+        self.seen.push_back(Seen {
+            at,
+            sent,
+            message_type,
+            sequence,
+            stamping,
+        });
+    }
+
+    /// Notes whether the time stamp of a frame sent came back, when, and
+    /// the time the card gave.
+    fn stamp_back(
+        &mut self,
+        message_type: MessageType,
+        sequence: u16,
+        now: Duration,
+        wire: Option<Duration>,
+    ) {
+        let wanted = Some(message_type as u8);
+        if let Some(seen) = self.seen.iter_mut().rev().find(|seen| {
+            seen.sent && seen.message_type == wanted && seen.sequence == Some(sequence)
+        }) {
+            seen.stamping = match wire {
+                Some(wire) => Stamping::Back {
+                    wait: now.saturating_sub(seen.at),
+                    wire,
+                },
+                None => Stamping::NeverCame,
+            };
+        }
+    }
 }
 
 /// What an end station has beyond a relay of one port.
@@ -482,6 +654,9 @@ impl Daemon {
                 }
             };
             let frame = &buffer[..received.length];
+            let stamping = received.time.map_or(Stamping::Missing, Stamping::Came);
+            let arrived = self.now();
+            self.ports[index].remember(arrived, frame, false, stamping);
             // Sync, Delay_Req, Pdelay_Req and Pdelay_Resp: of no use
             // without the time they came.
             let event = frame.first().is_some_and(|octet| octet & 0x0f < 4);
@@ -492,14 +667,89 @@ impl Daemon {
                 self.distrust_last(index);
             }
             let time = match received.time {
-                Some(time) => self.clocks.stamp(index, time),
-                None if event => continue,
+                Some(time) => {
+                    if header(frame).0 == Some(MessageType::Sync as u8) {
+                        self.ports[index].unstamped_syncs = 0;
+                    }
+                    self.clocks.stamp(index, time)
+                }
+                None if event => {
+                    self.left_unstamped(index, frame);
+                    continue;
+                }
                 None => Stamp::local(0),
             };
             let now = self.now();
             self.relay.handle_frame(now, number(index), frame, time);
             if let Some(end) = &mut self.end_station {
                 end.lite.handle_frame(now, frame, time.port);
+            }
+        }
+    }
+
+    /// An event message on port `index` came without a time stamp, so is
+    /// of no use: counted, and told while the count is small. An 802.11
+    /// port's frames never carry one.
+    fn left_unstamped(&mut self, index: usize, frame: &[u8]) {
+        let port = &mut self.ports[index];
+        if port.wireless {
+            return;
+        }
+        let (message_type, sequence) = header(frame);
+        if message_type == Some(MessageType::Sync as u8) {
+            port.unstamped_syncs += 1;
+            if let Some(sequence) = sequence {
+                port.last_unstamped_sync = sequence;
+            }
+        }
+        let what = type_name(message_type);
+        port.unstamped += 1;
+        let count = port.unstamped;
+        if count <= 10 || telling(count) {
+            let sequence = sequence.map_or_else(|| "?".to_owned(), |sequence| sequence.to_string());
+            eprintln!(
+                "{}: {what} {sequence} left out, it came without a time stamp ({count} so far)",
+                port.name
+            );
+        }
+    }
+
+    /// Tells the frames wired port `index` handled in the last second,
+    /// oldest first.
+    fn tell_seen(&self, index: usize) {
+        const PDELAY_REQ: u8 = MessageType::PdelayReq as u8;
+        const PDELAY_RESP: u8 = MessageType::PdelayResp as u8;
+        let Some(port) = self.ports.get(index).filter(|port| !port.wireless) else {
+            return;
+        };
+        let nanos = |time: Duration| time.as_nanos() as i128;
+        let now = self.now();
+        // The card's time each type was last received, by its nibble.
+        let mut last_received = [None::<Duration>; 16];
+        for (position, seen) in port.seen.iter().enumerate() {
+            let mut beside = Beside::default();
+            match (seen.sent, seen.message_type, seen.stamping) {
+                (false, Some(message_type), Stamping::Came(wire)) => {
+                    let last = &mut last_received[usize::from(message_type & 0x0f)];
+                    beside.wire_gap = last.map(|last| nanos(wire) - nanos(last));
+                    *last = Some(wire);
+                }
+                (true, Some(PDELAY_RESP), Stamping::Back { wire: t3, .. }) => {
+                    beside.turnaround = port.seen.iter().take(position).rev().find_map(|request| {
+                        match (request.sent, request.message_type, request.stamping) {
+                            (false, Some(PDELAY_REQ), Stamping::Came(t2))
+                                if request.sequence == seen.sequence =>
+                            {
+                                Some(nanos(t3) - nanos(t2))
+                            }
+                            _ => None,
+                        }
+                    });
+                }
+                _ => {}
+            }
+            if now.saturating_sub(seen.at) <= SHOWN_BEFORE_TIMEOUT {
+                eprintln!("{}: {}", port.name, seen.describe(now, beside));
             }
         }
     }
@@ -565,6 +815,13 @@ impl Daemon {
                 };
                 match sent {
                     Ok(()) => {
+                        let stamping = if transmit.stamp.is_some() {
+                            Stamping::Waiting
+                        } else {
+                            Stamping::NotAsked
+                        };
+                        let now = self.now();
+                        self.ports[index].remember(now, &transmit.frame, true, stamping);
                         if let Some((message_type, sequence)) = transmit.stamp {
                             waiting.push((index, message_type, sequence));
                             if message_type == MessageType::PdelayReq
@@ -631,7 +888,16 @@ impl Daemon {
         while let Some(event) = self.relay.poll_event() {
             match event {
                 Event::Grandmaster(_) => self.counts.grandmaster_changes += 1,
-                Event::SyncTimeout { .. } => self.counts.sync_timeouts += 1,
+                Event::SyncTimeout { port } => {
+                    self.counts.sync_timeouts += 1;
+                    self.changed = true;
+                    eprintln!("{}", self.describe(event));
+                    let count = self.counts.sync_timeouts;
+                    if count <= 10 || telling(count) {
+                        self.tell_seen(usize::from(port).wrapping_sub(1));
+                    }
+                    continue;
+                }
                 Event::DelayOutlier { port, .. } => {
                     let Some(port) = self.ports.get_mut(usize::from(port).wrapping_sub(1)) else {
                         continue;
@@ -686,8 +952,12 @@ impl Daemon {
     /// Gives the relay the time the event message last sent on port
     /// `index` left.
     fn collect(&mut self, index: usize, message_type: MessageType, sequence: u16) {
+        let result = self.ports[index].socket.transmit_time(STAMP_WAIT);
+        let now = self.now();
+        let wire = result.as_ref().ok().copied().flatten();
+        self.ports[index].stamp_back(message_type, sequence, now, wire);
         let port = &mut self.ports[index];
-        match port.socket.transmit_time(STAMP_WAIT) {
+        match result {
             Ok(Some(time)) => {
                 let time = self.clocks.stamp(index, time);
                 match (message_type, &mut self.end_station) {
@@ -760,7 +1030,24 @@ impl Daemon {
                 }
             ),
             Event::Grandmaster(None) => "no grandmaster".to_owned(),
-            Event::SyncTimeout { port } => format!("{}: no Sync for too long", name(port)),
+            Event::SyncTimeout { port } => {
+                let unstamped = self
+                    .ports
+                    .get(usize::from(port).wrapping_sub(1))
+                    .filter(|port| !port.wireless)
+                    .map(|port| (port.unstamped_syncs, port.last_unstamped_sync));
+                match unstamped {
+                    Some((0, _)) => format!(
+                        "{}: no Sync for too long, none came without a time stamp",
+                        name(port)
+                    ),
+                    Some((count, sequence)) => format!(
+                        "{}: no Sync for too long, {count} came without a time stamp, the latest {sequence}",
+                        name(port)
+                    ),
+                    None => format!("{}: no Sync for too long", name(port)),
+                }
+            }
             Event::DelayOutlier {
                 port,
                 delay,
@@ -1124,6 +1411,10 @@ fn run(options: Options) -> Result<(), String> {
             outliers: 0,
             stamps_every_frame: false,
             distrusted: 0,
+            unstamped: 0,
+            unstamped_syncs: 0,
+            last_unstamped_sync: 0,
+            seen: VecDeque::with_capacity(REMEMBERED),
             wireless,
             wifi: None,
         });
@@ -1378,6 +1669,58 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_header_is_read_even_from_a_frame_that_would_not_decode() {
+        let mut frame = [0u8; 44];
+        frame[0] = 0x10;
+        frame[30..32].copy_from_slice(&13297u16.to_be_bytes());
+        assert_eq!(header(&frame), (Some(0), Some(13297)));
+        assert_eq!(header(&frame[..20]), (Some(0), None));
+        assert_eq!(header(&[]), (None, None));
+        assert_eq!(type_name(Some(0xa)), "Pdelay_Resp_Follow_Up");
+        assert_eq!(type_name(Some(0x5)), "message");
+    }
+
+    #[test]
+    fn a_remembered_frame_tells_how_long_before_and_its_stamp() {
+        let seen = Seen {
+            at: Duration::from_millis(1000),
+            sent: true,
+            message_type: Some(MessageType::PdelayResp as u8),
+            sequence: Some(512),
+            stamping: Stamping::Back {
+                wait: Duration::from_micros(210),
+                wire: Duration::from_secs(7),
+            },
+        };
+        assert_eq!(
+            seen.describe(Duration::from_millis(1375), Beside::default()),
+            "375.0 ms before, sent Pdelay_Resp 512, its time stamp back after 0.210 ms"
+        );
+        let beside = Beside {
+            turnaround: Some(52_340),
+            ..Beside::default()
+        };
+        assert_eq!(
+            seen.describe(Duration::from_millis(1375), beside),
+            "375.0 ms before, sent Pdelay_Resp 512, its time stamp back after 0.210 ms, turnaround 52.340 us"
+        );
+        let sync = Seen {
+            sent: false,
+            message_type: Some(MessageType::Sync as u8),
+            stamping: Stamping::Came(Duration::from_secs(7)),
+            ..seen
+        };
+        let beside = Beside {
+            wire_gap: Some(127_004_000),
+            ..Beside::default()
+        };
+        assert_eq!(
+            sync.describe(Duration::from_millis(1250), beside),
+            "250.0 ms before, received Sync 512, stamped 127.004 ms after the Sync before"
+        );
+    }
 
     #[test]
     fn a_clock_identity_is_the_mac_made_eui_64() {
