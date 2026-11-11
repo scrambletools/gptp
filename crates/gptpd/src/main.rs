@@ -63,6 +63,14 @@ const REMEMBERED: usize = 64;
 /// How far back a Sync timeout shows the frames its port handled.
 const SHOWN_BEFORE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How far from the interval its header gives a neighbor's Sync or
+/// Pdelay_Req may come, in ns, before it is told.
+const RHYTHM_SLACK: i128 = 1_000_000;
+
+/// The most lines about the rhythm told a minute on a port; the rest are
+/// counted.
+const RHYTHM_TOLD_A_MINUTE: u32 = 12;
+
 /// The exit status of `--check` when another PTP daemon holds the
 /// interface, for the unit's RestartPreventExitStatus=.
 const REFUSED: u8 = 3;
@@ -231,6 +239,30 @@ struct Port {
     last_unstamped_sync: u16,
     /// The last frames a wired port handled, oldest first.
     seen: VecDeque<Seen>,
+    /// The card's time and sequence ID of the last Sync and Pdelay_Req
+    /// received, none after one that came without a time stamp.
+    last_sync: Option<(Duration, u16)>,
+    last_pdelay_req: Option<(Duration, u16)>,
+    /// Syncs and Pdelay_Reqs received off the rhythm their headers give.
+    off_rhythm_syncs: u64,
+    off_rhythm_pdelay_reqs: u64,
+    /// A Pdelay_Req off its rhythm, its sequence ID, the card's time and
+    /// whether it was told, until the Pdelay_Resp to it has left.
+    off_rhythm_answer: Option<(u16, Duration, bool)>,
+    /// A Sync stamped off its rhythm, its sequence ID, its gap in ns and
+    /// whether it was told, until its Follow_Up comes.
+    off_rhythm_sync: Option<(u16, i128, bool)>,
+    /// The Sync interval the neighbor's headers give, in ns.
+    sync_interval: Option<i128>,
+    /// The origin and sequence ID of the last Follow_Up received.
+    last_follow_up: Option<(i128, u16)>,
+    /// Follow_Ups whose origins strayed while their Syncs' stamps did not.
+    off_rhythm_origins: u64,
+    /// The minute lines about the rhythm were last told in, how many, and
+    /// how many were held back.
+    rhythm_minute: u64,
+    rhythm_told: u32,
+    rhythm_untold: u64,
     /// Whether the port is an 802.11 port.
     wireless: bool,
     /// An 802.11 port's radio, whose Action frames carry the timing,
@@ -391,6 +423,189 @@ impl Port {
                 None => Stamping::NeverCame,
             };
         }
+        if message_type == MessageType::PdelayResp
+            && let Some((asked, t2, told)) = self.off_rhythm_answer
+            && asked == sequence
+        {
+            self.off_rhythm_answer = None;
+            if told {
+                match wire {
+                    Some(t3) => eprintln!(
+                        "{}: Pdelay_Resp {sequence} answered it, turnaround {:.3} us",
+                        self.name,
+                        (t3.as_nanos() as i128 - t2.as_nanos() as i128) as f64 / 1e3
+                    ),
+                    None => eprintln!(
+                        "{}: Pdelay_Resp {sequence} answered it, its time stamp never came",
+                        self.name
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Notes a Sync or Pdelay_Req a wired port received: one stamped more
+    /// than [`RHYTHM_SLACK`] from its interval after the one before it is
+    /// counted, and told, a few a minute. A neighbor's schedule slipping so
+    /// came before each of its Sync timeouts on the bench.
+    fn note_rhythm(&mut self, at: Duration, frame: &[u8], wire: Option<Duration>) {
+        const SYNC: u8 = MessageType::Sync as u8;
+        const PDELAY_REQ: u8 = MessageType::PdelayReq as u8;
+        const FOLLOW_UP: u8 = MessageType::FollowUp as u8;
+        if self.wireless {
+            return;
+        }
+        let (message_type, sequence) = header(frame);
+        if message_type == Some(FOLLOW_UP) {
+            self.note_origin(at, frame, sequence);
+            return;
+        }
+        if message_type == Some(SYNC)
+            && let Some(interval) = frame.get(33).and_then(|&octet| interval_nanos(octet as i8))
+        {
+            self.sync_interval = Some(interval);
+        }
+        let last = match message_type {
+            Some(SYNC) => &mut self.last_sync,
+            Some(PDELAY_REQ) => &mut self.last_pdelay_req,
+            _ => return,
+        };
+        let before = last.take();
+        let (Some(wire), Some(sequence)) = (wire, sequence) else {
+            return;
+        };
+        *last = Some((wire, sequence));
+        let Some((before_wire, before_sequence)) = before else {
+            return;
+        };
+        let interval = frame
+            .get(33)
+            .and_then(|&octet| interval_nanos(octet as i8))
+            .filter(|_| sequence == before_sequence.wrapping_add(1));
+        let Some(interval) = interval else {
+            return;
+        };
+        let gap = wire.as_nanos() as i128 - before_wire.as_nanos() as i128;
+        if !off_rhythm(gap, interval) {
+            return;
+        }
+        let told = self.may_tell_rhythm(at);
+        let count = if message_type == Some(SYNC) {
+            self.off_rhythm_sync = Some((sequence, gap, told));
+            self.off_rhythm_syncs += 1;
+            self.off_rhythm_syncs
+        } else {
+            self.off_rhythm_answer = Some((sequence, wire, told));
+            self.off_rhythm_pdelay_reqs += 1;
+            self.off_rhythm_pdelay_reqs
+        };
+        if told {
+            eprintln!(
+                "{}: {} {sequence} stamped {:.3} ms after the one before, {:+.3} ms off its \
+                 interval ({count} so far)",
+                self.name,
+                type_name(message_type),
+                gap as f64 / 1e6,
+                (gap - interval) as f64 / 1e6
+            );
+        }
+    }
+
+    /// Notes when a neighbor's Follow_Up says its Sync left, its precise
+    /// origin plus its correction. Told beside a Sync stamped off its
+    /// rhythm, so that a Sync sent late tells from one stamped late, and
+    /// on its own when the origins stray while the stamps did not.
+    fn note_origin(&mut self, at: Duration, frame: &[u8], sequence: Option<u16>) {
+        let before = self.last_follow_up.take();
+        let (Some(sequence), Some(origin)) = (sequence, follow_up_origin(frame)) else {
+            return;
+        };
+        self.last_follow_up = Some((origin, sequence));
+        let flagged = self
+            .off_rhythm_sync
+            .take_if(|(flagged, _, _)| *flagged == sequence);
+        let (Some((before_origin, before_sequence)), Some(interval)) = (before, self.sync_interval)
+        else {
+            return;
+        };
+        if sequence != before_sequence.wrapping_add(1) {
+            return;
+        }
+        let gap = origin - before_origin;
+        let off = (gap - interval) as f64 / 1e6;
+        match flagged {
+            Some((_, stamped, true)) => eprintln!(
+                "{}: Follow_Up {sequence} puts its Sync's origin {:.3} ms after the one before, \
+                 {off:+.3} ms off its interval, stamped {:+.3} ms off",
+                self.name,
+                gap as f64 / 1e6,
+                (stamped - interval) as f64 / 1e6
+            ),
+            Some(_) => {}
+            None if off_rhythm(gap, interval) => {
+                self.off_rhythm_origins += 1;
+                let count = self.off_rhythm_origins;
+                if self.may_tell_rhythm(at) {
+                    eprintln!(
+                        "{}: Follow_Up {sequence} puts its Sync's origin {:.3} ms after the one \
+                         before, {off:+.3} ms off its interval, its stamp within it ({count} so far)",
+                        self.name,
+                        gap as f64 / 1e6
+                    );
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Whether another line about the rhythm may be told this minute; how
+    /// many were held back is told with the next that is.
+    fn may_tell_rhythm(&mut self, at: Duration) -> bool {
+        let minute = at.as_secs() / 60;
+        if minute != self.rhythm_minute {
+            self.rhythm_minute = minute;
+            self.rhythm_told = 0;
+        }
+        if self.rhythm_told >= RHYTHM_TOLD_A_MINUTE {
+            self.rhythm_untold += 1;
+            return false;
+        }
+        self.rhythm_told += 1;
+        if self.rhythm_untold > 0 {
+            eprintln!(
+                "{}: {} more off their rhythm before this, not told",
+                self.name, self.rhythm_untold
+            );
+            self.rhythm_untold = 0;
+        }
+        true
+    }
+}
+
+/// A Follow_Up's precise origin timestamp plus its correction, in ns: when
+/// its Sync left, on the grandmaster's time.
+fn follow_up_origin(frame: &[u8]) -> Option<i128> {
+    let correction = i64::from_be_bytes(frame.get(8..16)?.try_into().ok()?);
+    let seconds = frame
+        .get(34..40)?
+        .iter()
+        .fold(0i128, |value, &octet| (value << 8) | i128::from(octet));
+    let nanoseconds = u32::from_be_bytes(frame.get(40..44)?.try_into().ok()?);
+    Some(seconds * 1_000_000_000 + i128::from(nanoseconds) + i128::from(correction >> 16))
+}
+
+/// Whether a gap between two of a neighbor's messages strays more than
+/// [`RHYTHM_SLACK`] from their interval, both in ns.
+fn off_rhythm(gap: i128, interval: i128) -> bool {
+    (gap - interval).abs() > RHYTHM_SLACK
+}
+
+/// A logMessageInterval's interval in nanoseconds, where it gives one.
+fn interval_nanos(log: i8) -> Option<i128> {
+    match log {
+        0..=8 => Some(1_000_000_000 << log),
+        -9..=-1 => Some(1_000_000_000 >> -log),
+        _ => None,
     }
 }
 
@@ -657,6 +872,7 @@ impl Daemon {
             let stamping = received.time.map_or(Stamping::Missing, Stamping::Came);
             let arrived = self.now();
             self.ports[index].remember(arrived, frame, false, stamping);
+            self.ports[index].note_rhythm(arrived, frame, received.time);
             // Sync, Delay_Req, Pdelay_Req and Pdelay_Resp: of no use
             // without the time they came.
             let event = frame.first().is_some_and(|octet| octet & 0x0f < 4);
@@ -1415,6 +1631,18 @@ fn run(options: Options) -> Result<(), String> {
             unstamped_syncs: 0,
             last_unstamped_sync: 0,
             seen: VecDeque::with_capacity(REMEMBERED),
+            last_sync: None,
+            last_pdelay_req: None,
+            off_rhythm_syncs: 0,
+            off_rhythm_pdelay_reqs: 0,
+            off_rhythm_answer: None,
+            off_rhythm_sync: None,
+            sync_interval: None,
+            last_follow_up: None,
+            off_rhythm_origins: 0,
+            rhythm_minute: 0,
+            rhythm_told: 0,
+            rhythm_untold: 0,
             wireless,
             wifi: None,
         });
@@ -1680,6 +1908,41 @@ mod tests {
         assert_eq!(header(&[]), (None, None));
         assert_eq!(type_name(Some(0xa)), "Pdelay_Resp_Follow_Up");
         assert_eq!(type_name(Some(0x5)), "message");
+    }
+
+    #[test]
+    fn a_log_interval_gives_its_interval_where_it_can() {
+        assert_eq!(interval_nanos(-3), Some(125_000_000));
+        assert_eq!(interval_nanos(0), Some(1_000_000_000));
+        assert_eq!(interval_nanos(1), Some(2_000_000_000));
+        assert_eq!(interval_nanos(-9), Some(1_953_125));
+        assert_eq!(interval_nanos(127), None);
+        assert_eq!(interval_nanos(-128), None);
+        // The bench's slip: a Pdelay_Req 2.15 ms early and the Sync after
+        // it 2.26 ms late are told, a Sync 6 us off is not.
+        assert!(off_rhythm(997_848_000, 1_000_000_000));
+        assert!(off_rhythm(127_261_000, 125_000_000));
+        assert!(!off_rhythm(125_006_000, 125_000_000));
+    }
+
+    #[test]
+    fn a_follow_up_gives_its_syncs_origin_with_the_correction() {
+        let mut frame = [0u8; 76];
+        frame[0] = 0x18;
+        // 1.5 ns of correction, scaled by 2^16, comes off as 1 ns.
+        frame[8..16].copy_from_slice(&(3i64 << 15).to_be_bytes());
+        frame[34..40].copy_from_slice(&[0, 0, 0, 0, 0x01, 0x02]);
+        frame[40..44].copy_from_slice(&125_000_000u32.to_be_bytes());
+        assert_eq!(
+            follow_up_origin(&frame),
+            Some(258 * 1_000_000_000 + 125_000_001)
+        );
+        frame[8..16].copy_from_slice(&(-(1i64 << 16)).to_be_bytes());
+        assert_eq!(
+            follow_up_origin(&frame),
+            Some(258 * 1_000_000_000 + 124_999_999)
+        );
+        assert_eq!(follow_up_origin(&frame[..40]), None);
     }
 
     #[test]

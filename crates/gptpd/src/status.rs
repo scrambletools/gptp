@@ -105,6 +105,13 @@ pub(crate) fn text(daemon: &Daemon) -> String {
                 port.unstamped
             );
         }
+        if port.off_rhythm_syncs + port.off_rhythm_pdelay_reqs + port.off_rhythm_origins > 0 {
+            let _ = write!(
+                text,
+                ", {} Syncs, {} Pdelay_Reqs and {} Sync origins off their rhythm",
+                port.off_rhythm_syncs, port.off_rhythm_pdelay_reqs, port.off_rhythm_origins
+            );
+        }
         text.push('\n');
     }
     text

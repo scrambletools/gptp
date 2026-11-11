@@ -60,6 +60,13 @@
   port's frames of the last second: how long after the last of its type
   the card stamped each one received, each Pdelay_Resp's turnaround,
   and the stamps sent that never came back.
+- gptpd tells each Sync or Pdelay_Req from a neighbor that its card
+  stamped more than 1 ms off the interval its header gives, a few a
+  minute, with counts in the status. Beside an early Pdelay_Req it
+  tells how soon the Pdelay_Resp to it left, and beside a late Sync
+  when its Follow_Up says it left, so a Sync sent late tells from one
+  stamped late. A switch's two timers colliding so came before each of
+  its Sync timeouts on the bench.
 
 ## [0.1.0] - 2026-10-31
 
