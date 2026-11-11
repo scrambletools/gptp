@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+- raw-ether: `broker::Kind::Launch`, a raw packet socket whose frames
+  carry launch times on CLOCK_TAI (SO_TXTIME, its drops reported on the
+  error queue), for the ETF queue discipline to hand to a card that sends
+  each at its time, as the Intel I210 does. It takes CAP_NET_ADMIN as
+  well, so a helper granted only CAP_NET_RAW answers EPERM, and an older
+  one EINVAL; `broker::open` gives PermissionDenied for it, naming
+  CAP_NET_ADMIN and the program to grant it to. `broker::Kind` is now
+  `#[non_exhaustive]`, a breaking change.
 - gptp: the FTM responder follows up a frame with its times alone where
   the relay has no Follow_Up for it yet, so a station that only ranges
   still measures; Timing Measurement still waits for the Follow_Up. A

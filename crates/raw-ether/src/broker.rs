@@ -12,7 +12,9 @@
 //! keeps the other end of: one octet, the kind of socket. It answers each
 //! with four octets, zero or the error number, and on success the new
 //! socket's descriptor beside them. It makes nothing but packet sockets,
-//! and stops when the app closes its end.
+//! and stops when the app closes its end. A helper granted CAP_NET_ADMIN
+//! as well makes [`Kind::Launch`] sockets, whose frames a card sends at
+//! their times; one without answers EPERM for them.
 
 #![allow(unsafe_code)]
 
@@ -26,11 +28,23 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 
 /// A kind of packet socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Kind {
     /// Frames' payloads, the link-layer header taken off and put on.
     Datagram = 1,
     /// Whole frames, header and all.
     Raw = 2,
+    /// Whole frames, each sent at the launch time it carries on CLOCK_TAI
+    /// (SO_TXTIME), for the ETF queue discipline to hand to a card that
+    /// sends it at that time, and the frames ETF drops reported on the
+    /// socket's error queue. A departure time on CLOCK_TAI takes
+    /// CAP_NET_ADMIN as well as CAP_NET_RAW: a helper without it answers
+    /// EPERM, as one older than this kind answers EINVAL, and the app
+    /// takes a [`Kind::Raw`] socket instead. The drops come on the error
+    /// queue as SO_EE_ORIGIN_TXTIME, so an app also taking transmit time
+    /// stamps on it tells the two apart by origin. A launch time with no
+    /// ETF on the frame's queue is ignored, and the frame sent at once.
+    Launch = 3,
 }
 
 impl Kind {
@@ -38,6 +52,7 @@ impl Kind {
         match octet {
             1 => Some(Self::Datagram),
             2 => Some(Self::Raw),
+            3 => Some(Self::Launch),
             _ => None,
         }
     }
@@ -45,14 +60,24 @@ impl Kind {
     fn socket_type(self) -> libc::c_int {
         match self {
             Self::Datagram => libc::SOCK_DGRAM,
-            Self::Raw => libc::SOCK_RAW,
+            Self::Raw | Self::Launch => libc::SOCK_RAW,
         }
     }
 }
 
 /// A packet socket of `kind` for no protocol, made here: it takes
-/// CAP_NET_RAW.
+/// CAP_NET_RAW, and CAP_NET_ADMIN too for [`Kind::Launch`]. The helper
+/// answers with the error number alone, so each stays the system's.
 fn make(kind: Kind) -> io::Result<OwnedFd> {
+    let fd = packet_socket(kind)?;
+    if kind == Kind::Launch {
+        launch_on_tai(&fd)?;
+    }
+    Ok(fd)
+}
+
+/// A packet socket of `kind`'s type for no protocol: it takes CAP_NET_RAW.
+fn packet_socket(kind: Kind) -> io::Result<OwnedFd> {
     // SAFETY: plain system call with integer arguments.
     let raw = unsafe { libc::socket(libc::AF_PACKET, kind.socket_type() | libc::SOCK_CLOEXEC, 0) };
     if raw < 0 {
@@ -60,6 +85,47 @@ fn make(kind: Kind) -> io::Result<OwnedFd> {
     }
     // SAFETY: `raw` is a socket this function just opened and owns.
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Has `fd`'s frames carry launch times: on CLOCK_TAI, ETF's clock,
+/// without deadline mode, as a frame should leave at its time and not
+/// before, and each frame dropped reported. It takes CAP_NET_ADMIN.
+fn launch_on_tai(fd: &OwnedFd) -> io::Result<()> {
+    let timing = libc::sock_txtime {
+        clockid: libc::CLOCK_TAI,
+        flags: libc::SOF_TXTIME_REPORT_ERRORS,
+    };
+    // SAFETY: `timing` lives through the call, and the length passed is
+    // its size.
+    let set = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TXTIME,
+            (&raw const timing).cast(),
+            size_of::<libc::sock_txtime>() as libc::socklen_t,
+        )
+    };
+    if set < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The error for a [`Kind::Launch`] socket refused for want of
+/// CAP_NET_ADMIN, naming the program that needs it.
+fn launch_capability(program: Option<&Path>) -> io::Error {
+    let grant = match program {
+        Some(program) => format!(
+            "; grant it with: sudo setcap cap_net_raw,cap_net_admin+ep {}",
+            program.display()
+        ),
+        None => String::new(),
+    };
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("launch times on CLOCK_TAI need CAP_NET_ADMIN as well as CAP_NET_RAW{grant}"),
+    )
 }
 
 /// The helper started and installed, and where it is, once there is one.
@@ -75,17 +141,39 @@ static INSTALLED: OnceLock<Installed> = OnceLock::new();
 static FOUND: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// A packet socket of `kind`: from the helper when one is installed, else
-/// made here. The error for one the capability is missing for carries
-/// [`crate::Blocked::RawCapability`]. For crates on this one opening
-/// sockets of their own, as avb-net does for AVTP streams.
+/// made here. The error for one CAP_NET_RAW is missing for carries
+/// [`crate::Blocked::RawCapability`]; a [`Kind::Launch`] one refused for
+/// want of CAP_NET_ADMIN is PermissionDenied, naming that capability. For
+/// crates on this one opening sockets of their own, as avb-net does for
+/// AVTP streams.
 pub fn open(kind: Kind) -> io::Result<OwnedFd> {
     let result = match INSTALLED.get() {
-        Some(installed) => installed
-            .broker
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .socket(kind),
-        None => make(kind),
+        Some(installed) => {
+            let made = installed
+                .broker
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .socket(kind);
+            match made {
+                // The helper made a socket as it started, so it holds
+                // CAP_NET_RAW: EPERM for a Launch one is CAP_NET_ADMIN.
+                Err(error) if kind == Kind::Launch && error.raw_os_error() == Some(libc::EPERM) => {
+                    return Err(launch_capability(Some(&installed.program)));
+                }
+                made => made,
+            }
+        }
+        None => match packet_socket(kind) {
+            Ok(fd) if kind == Kind::Launch => match launch_on_tai(&fd) {
+                Ok(()) => Ok(fd),
+                Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                    let program = std::env::current_exe().ok();
+                    return Err(launch_capability(program.as_deref()));
+                }
+                Err(error) => Err(error),
+            },
+            made => made,
+        },
     };
     result.map_err(|error| match error.raw_os_error() {
         Some(libc::EPERM | libc::EACCES) => crate::socket::raw_capability(),
@@ -374,6 +462,25 @@ mod tests {
     fn only_packet_sockets_are_asked_for() {
         assert_eq!(Kind::from_octet(1), Some(Kind::Datagram));
         assert_eq!(Kind::from_octet(2), Some(Kind::Raw));
-        assert_eq!(Kind::from_octet(3), None);
+        assert_eq!(Kind::from_octet(3), Some(Kind::Launch));
+        assert_eq!(Kind::from_octet(4), None);
+        for kind in [Kind::Datagram, Kind::Raw, Kind::Launch] {
+            assert_eq!(Kind::from_octet(kind as u8), Some(kind));
+        }
+    }
+
+    #[test]
+    fn a_launch_socket_refused_names_cap_net_admin() {
+        let error = launch_capability(Some(Path::new("/usr/lib/app/helper")));
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        // No error number, so open() does not take it for CAP_NET_RAW.
+        assert_eq!(error.raw_os_error(), None);
+        let text = error.to_string();
+        assert!(text.contains("CAP_NET_ADMIN"), "{text}");
+        assert!(
+            text.ends_with("setcap cap_net_raw,cap_net_admin+ep /usr/lib/app/helper"),
+            "{text}"
+        );
+        assert!(!launch_capability(None).to_string().contains("setcap"));
     }
 }
