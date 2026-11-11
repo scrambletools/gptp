@@ -49,6 +49,16 @@ pub enum Heard {
     },
 }
 
+/// What a station's Extended Capabilities say, as far as known yet.
+#[derive(Debug, PartialEq)]
+enum Advertised {
+    Known(Support),
+    /// hostapd has the station, but not yet its Association Request, which
+    /// carries them.
+    NotYet,
+    Unknown,
+}
+
 pub struct WifiPort {
     name: String,
     radio: Radio,
@@ -60,6 +70,9 @@ pub struct WifiPort {
     assumed: Option<Support>,
     stations: Vec<MacAddress>,
     peer: Option<MacAddress>,
+    /// Whether the peer was chosen before it associated, the ways to
+    /// measure it still to read.
+    unsettled: bool,
     /// Measurement frames sent: the cookie of each, and its dialog token.
     pending: VecDeque<(u64, u8)>,
 }
@@ -97,6 +110,7 @@ impl WifiPort {
             assumed,
             stations,
             peer: None,
+            unsettled: false,
             pending: VecDeque::new(),
         })
     }
@@ -126,6 +140,7 @@ impl WifiPort {
             eprintln!("{}: stamping {old}'s frames: {error}", self.name);
         }
         self.pending.clear();
+        self.unsettled = false;
         let Some(peer) = chosen else {
             return Some(Heard::Peer(None));
         };
@@ -133,24 +148,58 @@ impl WifiPort {
             eprintln!("{}: stamping {peer}'s frames: {error}", self.name);
         }
         self.peer = Some(peer);
-        let advertised = self.assumed.or_else(|| self.advertised(peer));
-        let theirs = advertised.unwrap_or(Support::BOTH);
+        let support = self.measured_with(peer).unwrap_or_else(|| {
+            eprintln!("{}: measuring {peer} once it has associated", self.name);
+            Support::NONE
+        });
+        Some(Heard::Peer(Some((peer, support))))
+    }
+
+    /// The ways to measure a peer chosen before it associated, once it has:
+    /// a station joins the radio on authenticating, before its Association
+    /// Request says what it takes part in.
+    pub fn settle(&mut self) -> Option<Heard> {
+        if !self.unsettled {
+            return None;
+        }
+        let peer = self.peer?;
+        let support = self.measured_with(peer)?;
+        Some(Heard::Peer(Some((peer, support))))
+    }
+
+    /// The ways both ends take part in to measure `peer`, told to the log,
+    /// or none while it has not yet associated.
+    fn measured_with(&mut self, peer: MacAddress) -> Option<Support> {
+        let advertised = match self.assumed {
+            Some(assumed) => Advertised::Known(assumed),
+            None => self.advertised(peer),
+        };
+        let theirs = match advertised {
+            Advertised::NotYet => {
+                self.unsettled = true;
+                return None;
+            }
+            Advertised::Known(theirs) => Some(theirs),
+            Advertised::Unknown => None,
+        };
+        self.unsettled = false;
         let support = Support {
-            timing_measurement: self.own.timing_measurement && theirs.timing_measurement,
+            timing_measurement: self.own.timing_measurement
+                && theirs.is_none_or(|theirs| theirs.timing_measurement),
             fine_timing_measurement: self.own.fine_timing_measurement
-                && theirs.fine_timing_measurement,
+                && theirs.is_none_or(|theirs| theirs.fine_timing_measurement),
         };
         eprintln!(
             "{}: measuring {peer} with {}{}",
             self.name,
             describe(support),
-            if advertised.is_none() {
+            if theirs.is_none() {
                 ", its capabilities unknown"
             } else {
                 ""
             }
         );
-        Some(Heard::Peer(Some((peer, support))))
+        Some(support)
     }
 
     /// What the radio has said since last asked.
@@ -244,35 +293,58 @@ impl WifiPort {
     /// The ways to measure `peer` takes part in, as its Extended
     /// Capabilities say: hostapd's record of a station, or the access
     /// point's beacon as wpa_supplicant keeps it.
-    fn advertised(&self, peer: MacAddress) -> Option<Support> {
-        let (folder, command, key) = if self.access_point {
-            ("/run/hostapd", "STA", "ext_capab=")
+    fn advertised(&self, peer: MacAddress) -> Advertised {
+        let (folder, command) = if self.access_point {
+            ("/run/hostapd", "STA")
         } else {
-            ("/run/wpa_supplicant", "BSS", "ie=")
+            ("/run/wpa_supplicant", "BSS")
         };
-        let answer = ask(
+        match ask(
             &format!("{folder}/{}", self.name),
             &format!("{command} {peer}"),
-        )
-        .inspect_err(|error| {
-            eprintln!("{}: asking {folder} of {peer}: {error}", self.name);
-        })
-        .ok()?;
-        if answer.is_empty() || answer.starts_with("FAIL") {
-            return None;
+        ) {
+            Ok(answer) => advertised_in(&answer, self.access_point),
+            Err(error) => {
+                eprintln!("{}: asking {folder} of {peer}: {error}", self.name);
+                Advertised::Unknown
+            }
         }
-        // A station that sent no Extended Capabilities has none of them.
-        let Some(octets) = answer.lines().find_map(|line| line.strip_prefix(key)) else {
-            return self.access_point.then_some(Support::NONE);
-        };
-        let octets = hex(octets)?;
-        let capabilities = if self.access_point {
-            &octets[..]
-        } else {
-            extended_capabilities(&octets).unwrap_or_default()
-        };
-        Some(support_of(capabilities))
     }
+}
+
+/// What hostapd's record of a station, or wpa_supplicant's of the access
+/// point, says of its Extended Capabilities.
+fn advertised_in(answer: &str, access_point: bool) -> Advertised {
+    if answer.is_empty() || answer.starts_with("FAIL") {
+        return Advertised::Unknown;
+    }
+    // hostapd keeps a station from its Authentication on, flagged [ASSOC]
+    // once its Association Request came.
+    if access_point
+        && !answer
+            .lines()
+            .any(|line| line.starts_with("flags=") && line.contains("[ASSOC]"))
+    {
+        return Advertised::NotYet;
+    }
+    let key = if access_point { "ext_capab=" } else { "ie=" };
+    // A station that sent no Extended Capabilities has none of them.
+    let Some(octets) = answer.lines().find_map(|line| line.strip_prefix(key)) else {
+        return if access_point {
+            Advertised::Known(Support::NONE)
+        } else {
+            Advertised::Unknown
+        };
+    };
+    let Some(octets) = hex(octets) else {
+        return Advertised::Unknown;
+    };
+    let capabilities = if access_point {
+        &octets[..]
+    } else {
+        extended_capabilities(&octets).unwrap_or_default()
+    };
+    Advertised::Known(support_of(capabilities))
 }
 
 impl AsFd for WifiPort {
@@ -374,6 +446,24 @@ mod tests {
         assert_eq!(support_of(&capabilities), Support::FINE_TIMING_MEASUREMENT);
         // A short element says nothing of the bits it lacks.
         assert_eq!(support_of(&[0, 0, 0x80]), Support::TIMING_MEASUREMENT);
+    }
+
+    #[test]
+    fn a_station_not_yet_associated_has_its_capabilities_to_come() {
+        let authenticated = "fc:01:2c:fd:e5:94\nflags=[AUTH]\naid=0\n";
+        assert_eq!(advertised_in(authenticated, true), Advertised::NotYet);
+        let associated =
+            "fc:01:2c:fd:e5:94\nflags=[AUTH][ASSOC][AUTHORIZED]\next_capab=000000000000000040\n";
+        assert_eq!(
+            advertised_in(associated, true),
+            Advertised::Known(Support::FINE_TIMING_MEASUREMENT)
+        );
+        let without = "fc:01:2c:fd:e5:94\nflags=[AUTH][ASSOC][AUTHORIZED]\n";
+        assert_eq!(
+            advertised_in(without, true),
+            Advertised::Known(Support::NONE)
+        );
+        assert_eq!(advertised_in("FAIL\n", true), Advertised::Unknown);
     }
 
     #[test]

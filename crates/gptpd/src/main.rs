@@ -348,6 +348,16 @@ impl Daemon {
         for index in reopen {
             self.open_radio(index);
         }
+        // A station chosen before it associated, measured once it has.
+        let settled: Vec<(usize, Heard)> = self
+            .ports
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, port)| Some((index, port.wifi.as_mut()?.settle()?)))
+            .collect();
+        for (index, heard) in settled {
+            self.hear(index, heard);
+        }
     }
 
     /// Opens 802.11 port `index`'s radio, its station chosen afresh.

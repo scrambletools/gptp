@@ -51,6 +51,10 @@
   had spare, so readers of version 1 records read it as before. A new
   public field, so code that builds a Mapping changes.
 - raw-ether 0.1.1: `HardwareClock::step`.
+- gptpd chooses an access point's station once hostapd has it
+  associated. nl80211 tells of a new station at authentication, before
+  hostapd has its extended capabilities, and gptpd took it for one that
+  measures neither way until it left.
 
 ## [0.1.0] - 2026-10-31
 
