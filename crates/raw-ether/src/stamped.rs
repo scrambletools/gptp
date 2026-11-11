@@ -128,6 +128,28 @@ pub fn enable(interface: &str) -> io::Result<()> {
     platform::enable(interface)
 }
 
+/// How an interface stamps, as linux/net_tstamp.h numbers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Setting {
+    pub tx_type: i32,
+    pub rx_filter: i32,
+}
+
+impl Setting {
+    /// Whether it is as [`enable`] sets it: frames sent that ask, and every
+    /// frame received.
+    pub fn is_enabled(&self) -> bool {
+        self.tx_type == 1 && self.rx_filter == 1
+    }
+}
+
+/// How `interface` stamps now. Another program can change it for every
+/// program, and a gPTP program would not otherwise notice. Takes the
+/// kernel's RTNL lock on recent kernels, so best asked rarely.
+pub fn setting(interface: &str) -> io::Result<Setting> {
+    platform::setting(interface)
+}
+
 /// The control message of SO_TIMESTAMPING's three times: the raw hardware
 /// time, the last, when it is there.
 #[cfg(any(target_os = "linux", test))]
@@ -246,6 +268,20 @@ mod platform {
             rx_filter: HWTSTAMP_FILTER_ALL,
         };
         configure(&fd, interface, SIOCSHWTSTAMP, &mut config)
+    }
+
+    pub fn setting(interface: &str) -> io::Result<super::Setting> {
+        let fd = crate::broker::open(crate::broker::Kind::Datagram)?;
+        let mut config = HardwareConfig {
+            flags: 0,
+            tx_type: 0,
+            rx_filter: 0,
+        };
+        configure(&fd, interface, SIOCGHWTSTAMP, &mut config)?;
+        Ok(super::Setting {
+            tx_type: config.tx_type,
+            rx_filter: config.rx_filter,
+        })
     }
 
     /// Gets or sets `interface`'s time stamping with `request`, through
@@ -701,6 +737,10 @@ mod platform {
         Err(unsupported())
     }
 
+    pub fn setting(_interface: &str) -> io::Result<super::Setting> {
+        Err(unsupported())
+    }
+
     pub fn wait_any(
         _sockets: &[&StampedSocket],
         _timeout: Option<Duration>,
@@ -744,6 +784,15 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_setting_is_enabled_only_as_enable_sets_it() {
+        let setting = |tx_type, rx_filter| Setting { tx_type, rx_filter };
+        assert!(setting(1, 1).is_enabled());
+        assert!(!setting(1, 0).is_enabled(), "receive stamps off");
+        assert!(!setting(0, 1).is_enabled(), "send stamps off");
+        assert!(!setting(1, 12).is_enabled(), "PTPv2 event frames only");
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

@@ -930,6 +930,29 @@ impl Daemon {
         }
     }
 
+    /// How an end station's wired port stamps, read again after a Sync
+    /// timeout: another program can turn its receive stamps off for every
+    /// program. Not on a bridge, as the read takes RTNL, which a radio's
+    /// driver there has held for seconds.
+    fn stamping_after_timeout(&self, index: usize) -> String {
+        let Some(port) = self.ports.get(index).filter(|port| !port.wireless) else {
+            return String::new();
+        };
+        if self.end_station.is_none() {
+            return String::new();
+        }
+        match stamped::setting(&port.name) {
+            Ok(setting) if setting.is_enabled() => {
+                ", its card still stamping every frame".to_owned()
+            }
+            Ok(setting) => format!(
+                ", its card now stamping with tx_type {} and rx_filter {}, not as set",
+                setting.tx_type, setting.rx_filter
+            ),
+            Err(error) => format!(", its card's stamping unread: {error}"),
+        }
+    }
+
     /// Tells the frames wired port `index` handled in the last second,
     /// oldest first.
     fn tell_seen(&self, index: usize) {
@@ -1107,7 +1130,8 @@ impl Daemon {
                 Event::SyncTimeout { port } => {
                     self.counts.sync_timeouts += 1;
                     self.changed = true;
-                    eprintln!("{}", self.describe(event));
+                    let stamping = self.stamping_after_timeout(usize::from(port).wrapping_sub(1));
+                    eprintln!("{}{stamping}", self.describe(event));
                     let count = self.counts.sync_timeouts;
                     if count <= 10 || telling(count) {
                         self.tell_seen(usize::from(port).wrapping_sub(1));

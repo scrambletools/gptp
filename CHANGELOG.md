@@ -67,6 +67,12 @@
   when its Follow_Up says it left, so a Sync sent late tells from one
   stamped late. A switch's two timers colliding so came before each of
   its Sync timeouts on the bench.
+- gptpd reads an end station's card's time stamping again at each Sync
+  timeout and says whether it still stamps every frame: another program
+  can change that for every program. Bridges skip the read, which takes
+  RTNL.
+- raw-ether 0.1.1: `stamped::setting` and `Setting`, how an interface
+  stamps now.
 
 ## [0.1.0] - 2026-10-31
 
