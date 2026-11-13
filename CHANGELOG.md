@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-12
+
+gptpd 0.2.0's packages; gptp 0.2.0, raw-ether 0.1.1 and raw-ether 0.2.0
+on crates.io.
+
 - raw-ether: `broker::Kind::Launch`, a raw packet socket whose frames
   carry launch times on CLOCK_TAI (SO_TXTIME, its drops reported on the
   error queue), for the ETF queue discipline to hand to a card that sends
