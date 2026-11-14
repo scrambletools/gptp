@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-14
+
+gptpd 0.2.1's packages.
+
 - gptpd: `sync-receipt-timeout`, an end station's syncReceiptTimeout in
   Sync intervals (802.1AS-2020 10.7.3.1), 3 by default. A switch that
   stops sending Sync for a second or so after a Pdelay exchange it
