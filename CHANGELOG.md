@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- gptp: `Relay::handle_unstamped_sync`. A Sync from the grandmaster that
+  came without a time stamp starts the Sync receipt timeout afresh, for
+  up to eight timeouts' worth in a row, so a card that drops a few
+  stamps no longer makes the system grandmaster while a better one is
+  heard. An I210 receiving another stream drops several a second.
+
 ## [0.2.0] - 2026-11-12
 
 gptpd 0.2.0's packages; gptp 0.2.0, raw-ether 0.1.1 and raw-ether 0.2.0

@@ -136,6 +136,8 @@ struct Bench {
     sequence: u16,
     /// Whether 802.11 stations ack the Timing Measurement frames.
     acks: bool,
+    /// Whether the card stamps the Syncs that come.
+    stamps_syncs: bool,
 }
 
 impl Bench {
@@ -172,6 +174,7 @@ impl Bench {
             sent: Vec::new(),
             sequence: 0,
             acks: true,
+            stamps_syncs: true,
         };
         for port in 1..=3 {
             bench.relay.set_port(Duration::ZERO, port, true);
@@ -276,7 +279,15 @@ impl Bench {
             },
             tlvs: &[],
         };
-        self.deliver(neighbor.port, &sync, received);
+        if self.stamps_syncs {
+            self.deliver(neighbor.port, &sync, received);
+        } else {
+            let mut frame = [0; 128];
+            let length = sync.encode(&mut frame).expect("encodes");
+            self.relay
+                .handle_unstamped_sync(self.now, neighbor.port, &frame[..length]);
+            self.drain();
+        }
         let mut tlvs = [0; 32];
         let length = Tlv::FollowUpInformation(FollowUpInformation::default())
             .encode(&mut tlvs)
@@ -715,6 +726,37 @@ fn a_grandmaster_that_stops_syncing_loses_the_timereceiver_port_until_its_next_a
         bench.relay.grandmaster().is_some(),
         "its next Announce qualifies it again"
     );
+}
+
+#[test]
+fn syncs_without_a_time_stamp_keep_the_grandmaster_and_leave_its_time_standing() {
+    let mut bench = Bench::new(std::vec![grandmaster(), endpoint(2, 0x30)]);
+    bench.run(Duration::from_millis(6_500));
+    bench.events();
+    let synced = bench.relay.last_sync();
+    bench.stamps_syncs = false;
+    bench.run(Duration::from_millis(7_500));
+    assert!(bench.relay.grandmaster().is_some());
+    assert!(!bench.events().contains(&Event::SyncTimeout { port: 1 }));
+    assert_eq!(bench.relay.last_sync(), synced, "no time from them");
+    bench.stamps_syncs = true;
+    bench.run(Duration::from_millis(7_625));
+    assert_eq!(bench.relay.last_sync(), Some(local(bench.now)));
+}
+
+#[test]
+fn a_card_that_stops_stamping_syncs_still_times_out() {
+    let mut bench = Bench::new(std::vec![grandmaster(), endpoint(2, 0x30)]);
+    bench.run(Duration::from_millis(6_500));
+    bench.events();
+    bench.stamps_syncs = false;
+    // 24 Syncs without a time stamp, to 9.5 s, each start the timeout
+    // afresh; the 25th on does not, so it ages at 9.875 s.
+    bench.run(Duration::from_millis(9_750));
+    assert!(bench.relay.grandmaster().is_some(), "not yet");
+    bench.run(Duration::from_millis(9_875));
+    assert_eq!(bench.relay.grandmaster(), None);
+    assert!(bench.events().contains(&Event::SyncTimeout { port: 1 }));
 }
 
 #[test]

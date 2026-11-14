@@ -890,6 +890,10 @@ impl Daemon {
                     self.clocks.stamp(index, time)
                 }
                 None if event => {
+                    if header(frame).0 == Some(MessageType::Sync as u8) {
+                        let now = self.now();
+                        self.relay.handle_unstamped_sync(now, number(index), frame);
+                    }
                     self.left_unstamped(index, frame);
                     continue;
                 }

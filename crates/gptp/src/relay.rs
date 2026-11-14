@@ -440,6 +440,9 @@ pub struct Relay {
     /// Sync waits for its own.
     synced: Option<(i128, FollowedUp)>,
     sync_expires: Option<Duration>,
+    /// Syncs in a row from the grandmaster that came without a time
+    /// stamp, since the last that came with one.
+    unstamped_syncs: u32,
     /// This system's time as grandmaster.
     time_base: TimeBase,
     /// Changes whenever this system's time base does (802.1AS-2020
@@ -468,6 +471,10 @@ const FOLLOW_UP_CONTROL: u8 = 2;
 const SIGNALING_CONTROL: u8 = 5;
 const RATE_SCALE: f64 = (1u64 << 41) as f64;
 const CORRECTION_SCALE: f64 = 65_536.0;
+/// How many Sync receipt timeouts' worth of Syncs in a row may come
+/// without a time stamp and still keep the grandmaster: 24 Syncs, 3 s,
+/// at the default interval and timeout.
+const UNSTAMPED_TIMEOUTS: u32 = 8;
 /// timeSource of a system announcing itself: its own oscillator.
 const INTERNAL_OSCILLATOR: u8 = 0xa0;
 
@@ -510,6 +517,7 @@ impl Relay {
             upstream: None,
             synced: None,
             sync_expires: None,
+            unstamped_syncs: 0,
             time_base: TimeBase::default(),
             time_base_indicator: 0,
             last_phase_change: 0,
@@ -673,6 +681,48 @@ impl Relay {
             // 1588's end-to-end exchange, which gPTP does not use.
             MessageType::DelayReq | MessageType::DelayResp => {}
         }
+    }
+
+    /// A Sync heard on port `number`, the octets after the Ethernet
+    /// header, that came without a hardware time stamp. It carries no
+    /// time, yet shows the grandmaster's Syncs still come, so the Sync
+    /// receipt timeout starts afresh: a card that drops a few stamps,
+    /// as an I210 does under a busy receive, does not make this system
+    /// grandmaster while a better one is heard. That holds for up to
+    /// [`UNSTAMPED_TIMEOUTS`] timeouts' worth in a row, so a card that
+    /// stops stamping still times out. Its Follow_Up finds no Sync to
+    /// follow. Says whether it counted.
+    pub fn handle_unstamped_sync(&mut self, now: Duration, number: u16, frame: &[u8]) -> bool {
+        let Ok(message) = Message::decode(frame) else {
+            return false;
+        };
+        if message.message_type() != MessageType::Sync
+            || message.header.major_sdo_id != 1
+            || message.header.domain != 0
+            || message.header.source.clock == self.config.identity.clock
+        {
+            return false;
+        }
+        let Some(index) = self.index(number) else {
+            return false;
+        };
+        if !self.ports[index].up
+            || self.ports[index].wireless.is_some()
+            || !self.is_grandmasters_sync(index, &message)
+        {
+            return false;
+        }
+        self.upstream = None;
+        self.unstamped_syncs = self.unstamped_syncs.saturating_add(1);
+        let held = UNSTAMPED_TIMEOUTS * u32::from(self.config.sync_receipt_timeout);
+        if self.unstamped_syncs > held {
+            return false;
+        }
+        self.sync_expires = Some(
+            now + interval(message.header.log_interval)
+                * u32::from(self.config.sync_receipt_timeout),
+        );
+        true
     }
 
     /// A frame heard on port `number` came without a hardware time stamp,
@@ -1306,18 +1356,24 @@ impl Relay {
         }
     }
 
-    fn receive_sync(&mut self, now: Duration, index: usize, message: &Message, received: Stamp) {
+    /// Whether a Sync on port `index` is the grandmaster's, from the
+    /// timereceiver port's neighbor.
+    fn is_grandmasters_sync(&self, index: usize, message: &Message) -> bool {
         let port = &self.ports[index];
-        if self.receiver != Some(port.number)
-            || !port.as_capable
-            || !message.header.flags.two_step()
-            || port
+        self.receiver == Some(port.number)
+            && port.as_capable
+            && message.header.flags.two_step()
+            && port
                 .information
                 .as_ref()
-                .is_none_or(|information| information.vector.source != message.header.source)
-        {
+                .is_some_and(|information| information.vector.source == message.header.source)
+    }
+
+    fn receive_sync(&mut self, now: Duration, index: usize, message: &Message, received: Stamp) {
+        if !self.is_grandmasters_sync(index, message) {
             return;
         }
+        self.unstamped_syncs = 0;
         self.sync_expires = Some(
             now + interval(message.header.log_interval)
                 * u32::from(self.config.sync_receipt_timeout),
@@ -1661,6 +1717,7 @@ impl Relay {
         if receiver != self.receiver {
             self.upstream = None;
             self.synced = None;
+            self.unstamped_syncs = 0;
             self.sync_expires = receiver.map(|_| {
                 now + interval(self.config.log_sync_interval)
                     * u32::from(self.config.sync_receipt_timeout)
