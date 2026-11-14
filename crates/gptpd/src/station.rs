@@ -375,7 +375,9 @@ impl Station {
     /// from the last line written, on the hardware clock, which nothing
     /// steers. Then the last line is kept until a later Sync says the same
     /// as `mapping`'s, or for [`DOUBT_NANOS`], and the step starts a new
-    /// generation: one Sync with a bad time costs nothing. CLOCK_MONOTONIC
+    /// generation: one Sync with a bad time costs nothing. A line that
+    /// moved later, its Sync stamped late, waits out [`LATE_DOUBT_NANOS`]
+    /// whatever later Syncs say. CLOCK_MONOTONIC
     /// changing rate, as NTP steers it, moves no line on the hardware
     /// clock, so it is never taken for a step; the line kept goes on along
     /// CLOCK_MONOTONIC through the comparison as it stands.
@@ -400,8 +402,9 @@ impl Station {
         match self.doubted {
             Some((doubted, since))
                 if (doubted.local != mapping.local
+                    && moved(&doubted, &written) > 0
                     && moved(&mapping, &doubted).abs() <= STEADY_NANOS)
-                    || now - since >= DOUBT_NANOS =>
+                    || now - since >= doubt_nanos(moved(&doubted, &written)) =>
             {
                 self.doubted = None;
                 self.discontinue();
@@ -585,6 +588,22 @@ const SLEW_NANOS: i128 = 4_000;
 /// How long a line that moved is held back, waiting for a later Sync to
 /// say the same, before it is taken as a step anyway.
 const DOUBT_NANOS: i64 = 1_000_000_000;
+
+/// How long a line that moved later is held back before it is taken as a
+/// step. A card that gives a frame the next one's time stamp, as an I210
+/// does under a busy receive, stamps a Sync late, never early, and alike
+/// for Syncs in a row while another stream's frames keep step with them:
+/// a later Sync saying the same proves nothing, a step that lasts does.
+const LATE_DOUBT_NANOS: i64 = 5_000_000_000;
+
+/// How long a line `moved` nanoseconds from the last is held back.
+fn doubt_nanos(moved: i128) -> i64 {
+    if moved < 0 {
+        LATE_DOUBT_NANOS
+    } else {
+        DOUBT_NANOS
+    }
+}
 
 /// What became of a line that moved, for the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -869,6 +888,44 @@ mod tests {
         assert!(matches!(
             station.take_steadying(),
             Some(Steadying::Stepped(_, 11))
+        ));
+    }
+
+    #[test]
+    fn a_late_line_a_later_sync_says_again_is_still_held_back() {
+        let mut station = station();
+        published(&mut station, sync(0, 0), 1);
+        let before = published(&mut station, sync(1, 0), 2);
+        published(&mut station, sync(2, -20_000), 3);
+        assert!(matches!(
+            station.take_steadying(),
+            Some(Steadying::HeldBack(moved)) if (moved + 20_000).abs() < 10
+        ));
+        let again = published(&mut station, sync(3, -20_000), 4);
+        assert_eq!((again.generation, station.take_steadying()), (10, None));
+        assert!((again.at_monotonic - before.grandmaster_at(again.monotonic)).abs() < 10);
+        let back = published(&mut station, sync(4, 0), 5);
+        assert_eq!(station.take_steadying(), Some(Steadying::Dropped));
+        assert_eq!(back.generation, 10);
+    }
+
+    #[test]
+    fn a_late_line_held_back_through_its_longer_doubt_is_taken_as_a_step() {
+        let mut station = station();
+        published(&mut station, sync(0, 0), 1);
+        published(&mut station, sync(1, 0), 2);
+        let start = 1_000_000;
+        published(&mut station, sync(2, -20_000), start);
+        station.take_steadying();
+        let still = published(&mut station, sync(3, -20_000), start + DOUBT_NANOS);
+        assert_eq!((still.generation, station.take_steadying()), (10, None));
+        let still = published(&mut station, sync(4, -20_000), start + LATE_DOUBT_NANOS - 1);
+        assert_eq!((still.generation, station.take_steadying()), (10, None));
+        let taken = published(&mut station, sync(5, -20_000), start + LATE_DOUBT_NANOS);
+        assert_eq!(taken.generation, 11);
+        assert!(matches!(
+            station.take_steadying(),
+            Some(Steadying::Stepped(moved, 11)) if (moved + 20_000).abs() < 10
         ));
     }
 

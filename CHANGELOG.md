@@ -7,6 +7,11 @@
   up to eight timeouts' worth in a row, so a card that drops a few
   stamps no longer makes the system grandmaster while a better one is
   heard. An I210 receiving another stream drops several a second.
+- gptpd: a line that moved later, its Sync stamped late, is held back
+  5 s whatever later Syncs say; one that moved earlier is still taken
+  once a later Sync says the same. An I210 gives a frame the next one's
+  stamp, so a Sync comes late, never early, and alike for Syncs in a
+  row while a stream's frames keep step with them.
 
 ## [0.2.0] - 2026-11-12
 
