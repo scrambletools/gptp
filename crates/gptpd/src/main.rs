@@ -1728,6 +1728,7 @@ fn run(options: Options) -> Result<(), String> {
         // An end station that may fall back says it is one (profile 2.1).
         config.link.endpoint_declaration = end.settings.profile != config::Profile::Gptp;
         config.send_gptp_capable = end.settings.gptp_capable;
+        config.sync_receipt_timeout = end.settings.sync_receipt_timeout;
     }
     let mut relay = Relay::new(config, ports.len() as u16);
     if let Some(end) = &end_station {

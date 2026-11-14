@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 /// asks of an endpoint.
 pub const PRIORITY1: u8 = 248;
 
+/// syncReceiptTimeout where the file says nothing: 802.1AS's 3.
+pub const SYNC_RECEIPT_TIMEOUT: u8 = 3;
+
 /// Which PTP profile an end station runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Profile {
@@ -35,6 +38,9 @@ pub struct Settings {
     /// Whether the port's hardware clock is kept near CLOCK_TAI, for cards
     /// that send frames at launch times on it (steer.rs).
     pub follow_tai: bool,
+    /// How many Sync intervals with no Sync from the grandmaster before
+    /// the port lets it go (802.1AS-2020 10.7.3.1, syncReceiptTimeout).
+    pub sync_receipt_timeout: u8,
 }
 
 impl Default for Settings {
@@ -44,6 +50,7 @@ impl Default for Settings {
             profile: Profile::Auto,
             gptp_capable: true,
             follow_tai: false,
+            sync_receipt_timeout: SYNC_RECEIPT_TIMEOUT,
         }
     }
 }
@@ -117,6 +124,18 @@ pub fn parse(text: &str) -> Result<Settings, String> {
                         ));
                     }
                 };
+            }
+            "sync-receipt-timeout" => {
+                settings.sync_receipt_timeout = value
+                    .parse()
+                    .ok()
+                    .filter(|intervals| *intervals > 0)
+                    .ok_or_else(|| {
+                        format!(
+                            "line {}: sync-receipt-timeout takes 1 to 255, not {value:?}",
+                            number + 1
+                        )
+                    })?;
             }
             _ => return Err(format!("line {}: unknown setting {key}", number + 1)),
         }
@@ -252,8 +271,17 @@ mod tests {
                 profile: Profile::AvbLite,
                 gptp_capable: true,
                 follow_tai: false,
+                sync_receipt_timeout: 3,
             })
         );
+        assert_eq!(
+            parse("sync-receipt-timeout 16")
+                .expect("settings")
+                .sync_receipt_timeout,
+            16
+        );
+        assert!(parse("sync-receipt-timeout 0").is_err());
+        assert!(parse("sync-receipt-timeout 256").is_err());
         assert!(parse("follow-tai yes").expect("settings").follow_tai);
         assert!(parse("follow-tai 1").is_err());
         assert!(parse("profile 1588").is_err());

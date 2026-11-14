@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+- gptpd: `sync-receipt-timeout`, an end station's syncReceiptTimeout in
+  Sync intervals (802.1AS-2020 10.7.3.1), 3 by default. A switch that
+  stops sending Sync for a second or so after a Pdelay exchange it
+  doubts makes the end station grandmaster for that second at 3; 16
+  rides it out.
 - gptp: `Relay::handle_unstamped_sync`. A Sync from the grandmaster that
   came without a time stamp starts the Sync receipt timeout afresh, for
   up to eight timeouts' worth in a row, so a card that drops a few
