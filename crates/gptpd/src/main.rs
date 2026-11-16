@@ -1510,6 +1510,10 @@ impl Daemon {
             Some(Steadying::Stepped(moved, generation)) => eprintln!(
                 "{name}: the grandmaster's time moved {moved} ns; a new generation, {generation}"
             ),
+            Some(Steadying::Crept(moved, over)) => eprintln!(
+                "{name}: the line crept {moved} ns in {} ms, no Sync far enough off to hold back",
+                over / 1_000_000
+            ),
             None => {}
         }
         let snapshot = status::snapshot(self);

@@ -8,6 +8,11 @@
   switch that stops sending Sync for a moment no longer starts a
   generation, nor, where its first Sync back was stamped late, steps
   the time out and back.
+- gptpd: a line more than 1 us later than the last is held back, as one
+  more than 5 us earlier is. A card stamping Syncs late stamps the next
+  about as late, and a line taking each within 5 us crept 9 us later
+  over two Syncs, then stepped back. gptpd also logs a line that creeps
+  more than 2 us in a second without any Sync held back.
 - gptp: `Relay::set_followed_line`, the grandmaster's time as the
   application follows it. A takeover carries it on rather than the last
   Sync's time, so a Sync the application held back, as one an I210

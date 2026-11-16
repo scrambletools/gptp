@@ -94,6 +94,9 @@ pub struct Station {
     kink: Option<i128>,
     /// A line that moved, held back since a CLOCK_MONOTONIC time.
     doubted: Option<(Mapping, i64)>,
+    /// A line taken, and when: the lines taken since are measured against
+    /// it, to tell a creep no single Sync showed.
+    creep_from: Option<(i64, Mapping)>,
     steadying: Option<Steadying>,
 }
 
@@ -167,6 +170,7 @@ impl Station {
             residual: None,
             kink: None,
             doubted: None,
+            creep_from: None,
             steadying: None,
         })
     }
@@ -400,12 +404,13 @@ impl Station {
     }
 
     /// `mapping`, unless its Sync's time stands more than [`STEADY_NANOS`]
-    /// from the last line written, on the hardware clock, which nothing
-    /// steers. Then the last line is kept until a later Sync says the same
-    /// as `mapping`'s, or for [`DOUBT_NANOS`], and the step starts a new
-    /// generation: one Sync with a bad time costs nothing. A line that
-    /// moved later, its Sync stamped late, waits out [`LATE_DOUBT_NANOS`]
-    /// whatever later Syncs say. CLOCK_MONOTONIC
+    /// earlier, or [`LATE_STEADY_NANOS`] later, than the last line written,
+    /// on the hardware clock, which nothing steers. Then the last line is
+    /// kept until a later Sync says the same as `mapping`'s, or for
+    /// [`DOUBT_NANOS`], and the step starts a new generation: one Sync with
+    /// a bad time costs nothing. A line that moved later, its Sync stamped
+    /// late, waits out [`LATE_DOUBT_NANOS`] whatever later Syncs say.
+    /// CLOCK_MONOTONIC
     /// changing rate, as NTP steers it, moves no line on the hardware
     /// clock, so it is never taken for a step; the line kept goes on along
     /// CLOCK_MONOTONIC through the comparison as it stands.
@@ -421,10 +426,11 @@ impl Station {
             return mapping;
         };
         let off = moved(&mapping, &written);
-        if off.abs() <= STEADY_NANOS {
+        if (-LATE_STEADY_NANOS..=STEADY_NANOS).contains(&off) {
             if self.doubted.take().is_some() {
                 self.steadying = Some(Steadying::Dropped);
             }
+            self.measure_creep(mapping, now);
             return slewed(mapping, &written);
         }
         match self.doubted {
@@ -456,6 +462,30 @@ impl Station {
                 slewed(held, &written)
             }
         }
+    }
+
+    /// Tells, once a [`CREEP_SPAN_NANOS`] has passed, how far the line
+    /// taken now stands from the one taken then, where more than
+    /// [`CREEP_TOLD_NANOS`]: a line moving each Sync within the steady
+    /// bounds, as Syncs stamped later and later would move it.
+    fn measure_creep(&mut self, mapping: Mapping, now: i64) {
+        let Some((since, from)) = self.creep_from.filter(|(_, from)| {
+            from.generation == mapping.generation && from.grandmaster == mapping.grandmaster
+        }) else {
+            self.creep_from = Some((now, mapping));
+            return;
+        };
+        if now - since < CREEP_SPAN_NANOS {
+            return;
+        }
+        let crept = mapping.at_local - from.grandmaster_at_local(mapping.local);
+        if crept.abs() > CREEP_TOLD_NANOS {
+            if self.steadying.is_some() {
+                return;
+            }
+            self.steadying = Some(Steadying::Crept(crept, now - since));
+        }
+        self.creep_from = Some((now, mapping));
     }
 
     /// The last line written on the hardware clock, put on CLOCK_MONOTONIC
@@ -607,6 +637,21 @@ const HOLDOVER_NANOS: i64 = 5_000_000_000;
 /// applications see a step.
 const STEADY_NANOS: i128 = 5_000;
 
+/// How far, in nanoseconds, a Sync's time may stand later than the last
+/// line written before it is held back. A card stamping a Sync late stamps
+/// the next about as late, so a line taking each within [`STEADY_NANOS`]
+/// crept later with them, 9 us over two Syncs as measured. Far more than
+/// a line's rate errs by over a Sync interval.
+const LATE_STEADY_NANOS: i128 = 1_000;
+
+/// How long, in nanoseconds, the lines taken are measured against one
+/// taken before, to tell a creep.
+const CREEP_SPAN_NANOS: i64 = 1_000_000_000;
+
+/// How far, in nanoseconds, the line may creep over [`CREEP_SPAN_NANOS`]
+/// untold: far more than a line's rate errs by over that span.
+const CREEP_TOLD_NANOS: i128 = 2_000;
+
 /// How far, in nanoseconds, a mapping's line on CLOCK_MONOTONIC moves
 /// from the last one written: the comparison catching up with
 /// CLOCK_MONOTONIC changing rate puts it right over a few mappings, each
@@ -643,6 +688,9 @@ pub enum Steadying {
     /// A later Sync said the same, or it was held back long enough: a
     /// step of so many nanoseconds, and the new generation.
     Stepped(i128, u32),
+    /// The line taken moved so many nanoseconds over so many, each Sync
+    /// within the steady bounds.
+    Crept(i128, i64),
 }
 
 /// `mapping`, its line on CLOCK_MONOTONIC moved from `written`'s, where it
@@ -745,6 +793,7 @@ mod tests {
             residual: None,
             kink: None,
             doubted: None,
+            creep_from: None,
             steadying: None,
         };
         for step in 0..5_i128 {
@@ -950,6 +999,77 @@ mod tests {
         let still = published(&mut station, sync(4, -20_000), start + LATE_DOUBT_NANOS - 1);
         assert_eq!((still.generation, station.take_steadying()), (10, None));
         let taken = published(&mut station, sync(5, -20_000), start + LATE_DOUBT_NANOS);
+        assert_eq!(taken.generation, 11);
+        assert!(matches!(
+            station.take_steadying(),
+            Some(Steadying::Stepped(moved, 11)) if (moved + 20_000).abs() < 10
+        ));
+    }
+
+    #[test]
+    fn syncs_stamped_later_and_later_move_no_line() {
+        // Two Syncs stamped 4.5 us then 9 us late, then on time again: no
+        // creep 9 us later and no step back.
+        let mut station = station();
+        published(&mut station, sync(0, 0), 1);
+        let before = published(&mut station, sync(1, 0), 2);
+        let first = published(&mut station, sync(2, -4_500), 3);
+        assert!(matches!(
+            station.take_steadying(),
+            Some(Steadying::HeldBack(moved)) if (moved + 4_500).abs() < 10
+        ));
+        let second = published(&mut station, sync(3, -9_000), 4);
+        assert_eq!(station.take_steadying(), None);
+        published(&mut station, sync(4, 0), 5);
+        assert_eq!(station.take_steadying(), Some(Steadying::Dropped));
+        let after = published(&mut station, sync(5, 0), 6);
+        assert_eq!(station.take_steadying(), None);
+        for mapping in [first, second, after] {
+            assert_eq!(mapping.generation, 10);
+            assert!((mapping.at_monotonic - before.grandmaster_at(mapping.monotonic)).abs() < 10);
+        }
+    }
+
+    #[test]
+    fn a_line_creeping_within_the_steady_bounds_is_told() {
+        let mut station = station();
+        let now = |k: i128| (k * 125_000_000) as i64;
+        published(&mut station, sync(0, 0), now(0));
+        let mut told = None;
+        for k in 1..=12 {
+            published(&mut station, sync(k, -900 * k), now(k));
+            match station.take_steadying() {
+                None => {}
+                Some(Steadying::Crept(moved, over)) if told.is_none() => {
+                    told = Some((k, moved, over))
+                }
+                other => panic!("Sync {k}: {other:?}"),
+            }
+        }
+        let (k, moved, over) = told.expect("a creep told");
+        assert_eq!((k, over), (9, 1_000_000_000));
+        assert!((moved + 7_200).abs() < 10, "{moved} ns");
+        assert_eq!(station.mapping(sync(12, -10_800), now(12)).generation, 10);
+    }
+
+    #[test]
+    fn a_line_moving_later_2_us_a_sync_is_taken_once_its_doubt_is_out() {
+        let mut station = station();
+        let start = 1_000_000;
+        published(&mut station, sync(0, 0), start - 2);
+        let before = published(&mut station, sync(1, 0), start - 1);
+        let mut k = 2;
+        let mut now = start;
+        while now < start + LATE_DOUBT_NANOS {
+            let off = -2_000 * (k - 1).min(10);
+            let held = published(&mut station, sync(k, off), now);
+            assert_eq!(held.generation, 10, "Sync {k}");
+            assert!((held.at_monotonic - before.grandmaster_at(held.monotonic)).abs() < 10);
+            k += 1;
+            now += 125_000_000;
+        }
+        station.take_steadying();
+        let taken = published(&mut station, sync(k, -20_000), now);
         assert_eq!(taken.generation, 11);
         assert!(matches!(
             station.take_steadying(),
