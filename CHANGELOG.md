@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-16
+
+gptpd 0.2.2's packages.
+
 - gptpd: while this system stands in as grandmaster for one whose Syncs
   stopped, its record keeps the line it followed, for up to 5 s as
   while none is heard, and the first Sync back is weighed against it. A
