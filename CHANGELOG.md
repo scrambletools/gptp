@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- gptpd: the status socket goes on taking clients where a thread for
+  one cannot start: that client goes, logged, and the next is served.
+  The thread taking clients ended there before, and the socket refused
+  every client after. Its threads have 64 KiB stacks now.
+- gptpd: where RLIMIT_MEMLOCK binds, finite and without CAP_IPC_LOCK as
+  in an unprivileged container, only what is mapped at the start is
+  locked in RAM, and the limit is logged. Locking what is mapped later
+  too counted each thread's whole stack and each new piece of heap
+  against the limit, and past it threads could not start.
+
 ## [0.2.1] - 2026-11-14
 
 gptpd 0.2.1's packages.

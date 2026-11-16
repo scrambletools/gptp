@@ -10,6 +10,7 @@
 mod clocks;
 mod config;
 mod lite;
+mod memory;
 mod server;
 mod station;
 mod status;
@@ -1591,26 +1592,8 @@ fn open(name: &str, end_station: bool, wireless: bool) -> Result<StampedSocket, 
     Ok(socket)
 }
 
-/// Keeps the daemon in RAM, so none of it waits on the disk while a frame
-/// is due, however hard the computer swaps: what is mapped now at once,
-/// what is mapped later once touched, so thread stacks cost what they use.
-#[allow(unsafe_code)]
-fn lock_memory() {
-    // SAFETY: mlockall takes no memory.
-    let locked = unsafe {
-        libc::mlockall(libc::MCL_CURRENT) == 0
-            && libc::mlockall(libc::MCL_FUTURE | libc::MCL_ONFAULT) == 0
-    };
-    if !locked {
-        eprintln!(
-            "its memory may be paged out: mlockall: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-}
-
 fn run(options: Options) -> Result<(), String> {
-    lock_memory();
+    memory::lock();
     let status_path = options
         .status
         .clone()

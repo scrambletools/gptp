@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -23,6 +24,10 @@ const ANSWER: Duration = Duration::from_secs(5);
 
 /// The group whose members may send commands.
 const GROUP: &str = "gptpd";
+
+/// The stack of each of the socket's threads, which hold little: where
+/// RLIMIT_MEMLOCK binds, a stack counts against it in full.
+const STACK: usize = 64 << 10;
 
 /// A command from a client, with where its answer goes.
 pub struct Request {
@@ -74,14 +79,20 @@ impl Server {
         let (sender, requests) = mpsc::channel();
         let accepting = Arc::clone(&shared);
         let path = PathBuf::from(path);
-        thread::spawn(move || {
+        spawn("status", move || {
             for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => serve(stream, Arc::clone(&accepting), sender.clone()),
-                    Err(error) => eprintln!("{}: {error}", path.display()),
+                let served = stream.and_then(|stream| {
+                    serve(stream, Arc::clone(&accepting), sender.clone())
+                        .map_err(|error| io::Error::other(format!("a client dropped: {error}")))
+                });
+                if let Err(error) = served {
+                    eprintln!("{}: {error}", path.display());
+                    // What refused it, as too many files open or no
+                    // room for a thread, stays a while: not at once again.
+                    thread::sleep(Duration::from_millis(100));
                 }
             }
-        });
+        })?;
         Ok(Self { shared, requests })
     }
 
@@ -107,74 +118,99 @@ impl Server {
     }
 }
 
-/// Serves one client: snapshots from this thread, commands from another.
-fn serve(stream: UnixStream, shared: Arc<Shared>, requests: Sender<Request>) {
-    let Ok(reading) = stream.try_clone() else {
-        return;
-    };
+/// Starts a thread of the socket's, on a stack of [`STACK`].
+fn spawn(name: &str, work: impl FnOnce() + Send + 'static) -> io::Result<()> {
+    thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(STACK)
+        .spawn(work)
+        .map(drop)
+}
+
+/// Serves one client: snapshots from one thread, commands from another.
+/// Where either cannot start, the client goes.
+fn serve(stream: UnixStream, shared: Arc<Shared>, requests: Sender<Request>) -> io::Result<()> {
+    let reading = stream.try_clone()?;
     let writer = Arc::new(Mutex::new(stream));
     let replying = Arc::clone(&writer);
-    thread::spawn(move || {
-        let permitted = permitted(&reading);
-        for line in BufReader::new(reading).lines() {
-            let Ok(line) = line else {
-                return;
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            let answer = match (&permitted, Command::parse(&line)) {
-                (_, Err(error)) => Err(error.0),
-                (Err(why), Ok(_)) => Err(why.clone()),
-                (Ok(()), Ok(command)) => {
-                    let (answer, answered) = mpsc::channel();
-                    if requests.send(Request { command, answer }).is_err() {
-                        return;
-                    }
-                    answered
-                        .recv_timeout(ANSWER)
-                        .unwrap_or_else(|_| Err("gptpd did not answer".to_owned()))
+    let sending = Arc::clone(&writer);
+    let started = spawn("status-reader", move || {
+        answer(reading, &replying, &requests)
+    })
+    .and_then(|()| spawn("status-writer", move || send(&sending, &shared)));
+    if started.is_err() {
+        // Ends the reader, if it started.
+        let _ = lock(&writer).shutdown(Shutdown::Both);
+    }
+    started
+}
+
+/// The client's stream, though a thread panicked holding it.
+fn lock(stream: &Mutex<UnixStream>) -> std::sync::MutexGuard<'_, UnixStream> {
+    stream.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Answers the client's commands.
+fn answer(reading: UnixStream, replying: &Mutex<UnixStream>, requests: &Sender<Request>) {
+    let permitted = permitted(&reading);
+    for line in BufReader::new(reading).lines() {
+        let Ok(line) = line else {
+            return;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let answer = match (&permitted, Command::parse(&line)) {
+            (_, Err(error)) => Err(error.0),
+            (Err(why), Ok(_)) => Err(why.clone()),
+            (Ok(()), Ok(command)) => {
+                let (answer, answered) = mpsc::channel();
+                if requests.send(Request { command, answer }).is_err() {
+                    return;
                 }
-            };
-            let mut reply = String::new();
-            let _ = Block::encode_reply(
-                &mut reply,
-                answer.as_ref().map(|_| ()).map_err(String::as_str),
-            );
-            let mut stream = replying.lock().unwrap_or_else(|poison| poison.into_inner());
-            if stream.write_all(reply.as_bytes()).is_err() {
-                return;
+                answered
+                    .recv_timeout(ANSWER)
+                    .unwrap_or_else(|_| Err("gptpd did not answer".to_owned()))
             }
+        };
+        let mut reply = String::new();
+        let _ = Block::encode_reply(
+            &mut reply,
+            answer.as_ref().map(|_| ()).map_err(String::as_str),
+        );
+        if lock(replying).write_all(reply.as_bytes()).is_err() {
+            return;
         }
-    });
-    thread::spawn(move || {
-        let mut sent = 0;
-        loop {
-            let (number, snapshot) = {
-                let latest = shared
-                    .snapshot
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
-                let deadline = Instant::now() + EVERY;
-                let (latest, _) = shared
-                    .changed
-                    .wait_timeout_while(latest, deadline - Instant::now(), |latest| {
-                        latest.0 == sent && sent != 0
-                    })
-                    .unwrap_or_else(|poison| poison.into_inner());
-                latest.clone()
-            };
-            if snapshot.is_empty() {
-                thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-            sent = number;
-            let mut stream = writer.lock().unwrap_or_else(|poison| poison.into_inner());
-            if stream.write_all(snapshot.as_bytes()).is_err() {
-                return;
-            }
+    }
+}
+
+/// Sends the client each snapshot.
+fn send(writer: &Mutex<UnixStream>, shared: &Shared) {
+    let mut sent = 0;
+    loop {
+        let (number, snapshot) = {
+            let latest = shared
+                .snapshot
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let deadline = Instant::now() + EVERY;
+            let (latest, _) = shared
+                .changed
+                .wait_timeout_while(latest, deadline - Instant::now(), |latest| {
+                    latest.0 == sent && sent != 0
+                })
+                .unwrap_or_else(|poison| poison.into_inner());
+            latest.clone()
+        };
+        if snapshot.is_empty() {
+            thread::sleep(Duration::from_millis(100));
+            continue;
         }
-    });
+        sent = number;
+        if lock(writer).write_all(snapshot.as_bytes()).is_err() {
+            return;
+        }
+    }
 }
 
 /// Whether the client on `stream` may send commands: root, or a member of
@@ -321,6 +357,148 @@ mod tests {
         let allowed = uid.as_ref().is_ok_and(|uid| *uid == 0)
             || uid.is_ok_and(|uid| member(&groups, &passwd, uid, u32::MAX));
         assert_eq!(reply.is_ok(), allowed, "{reply:?}");
+        fs::remove_file(&socket).expect("remove");
+    }
+
+    /// Address space mapped, under MCL_FUTURE, until RLIMIT_MEMLOCK has
+    /// room left for small allocations but for no thread's stack; given
+    /// back when dropped. A thread with no malloc arena, as none can be
+    /// made then, maps each allocation on its own.
+    struct Filler(*mut libc::c_void, usize);
+
+    impl Filler {
+        /// The room left: a page for each of a few allocations, less than
+        /// the socket's 64 KiB thread stacks.
+        const ROOM: u64 = 56 << 10;
+
+        /// None where the limit does not bind, as for root.
+        #[allow(unsafe_code)]
+        fn to_the_limit() -> Option<Self> {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: `limit` is what getrlimit fills.
+            if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &raw mut limit) } != 0
+                || limit.rlim_cur == libc::RLIM_INFINITY
+            {
+                return None;
+            }
+            // SAFETY: sysconf takes no memory.
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+            // Another thread may map something between reading and mapping.
+            for _ in 0..10 {
+                let status = fs::read_to_string("/proc/self/status").expect("status");
+                let locked = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("VmLck:"))
+                    .and_then(|kb| kb.trim().trim_end_matches(" kB").parse::<u64>().ok())
+                    .expect("VmLck")
+                    * 1024;
+                let size = limit.rlim_cur.checked_sub(locked + Self::ROOM)? / page * page;
+                let filler = Self(map(size as usize)?, size as usize);
+                if filler.0 == libc::MAP_FAILED {
+                    continue;
+                }
+                // A stack's worth more mapped all the same: it does not bind.
+                let stack = map(68 << 10)?;
+                if stack != libc::MAP_FAILED {
+                    // SAFETY: just mapped, and used by nothing.
+                    unsafe { libc::munmap(stack, 68 << 10) };
+                    return None;
+                }
+                return Some(filler);
+            }
+            None
+        }
+    }
+
+    /// An anonymous mapping of `size` bytes no one may touch.
+    #[allow(unsafe_code)]
+    fn map(size: usize) -> Option<*mut libc::c_void> {
+        if size == 0 {
+            return None;
+        }
+        // SAFETY: a new mapping, touching nothing.
+        Some(unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        })
+    }
+
+    impl Drop for Filler {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            if self.0 != libc::MAP_FAILED {
+                // SAFETY: mapped by `to_the_limit`, and used by nothing.
+                unsafe { libc::munmap(self.0, self.1) };
+            }
+        }
+    }
+
+    /// A client gets a snapshot, and an answer to a command, so all the
+    /// socket's threads so far are running.
+    fn served(server: &Server, client: &mut gptp::status::Client) {
+        let Some(Block::Status(_)) = client.next(Some(Duration::from_secs(5))).expect("next")
+        else {
+            panic!("no snapshot");
+        };
+        client.set_priority1(255).expect("send");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            for request in server.requests() {
+                let _ = request.answer.send(Ok(()));
+            }
+            match client.next(Some(Duration::from_millis(50))).expect("next") {
+                Some(Block::Reply(_)) => return,
+                _ if Instant::now() > deadline => panic!("no reply"),
+                _ => {}
+            }
+        }
+    }
+
+    /// In a container, where RLIMIT_MEMLOCK binds and the daemon locks
+    /// what it maps later, a thread may fail to start: the client it was
+    /// for goes, and the socket goes on taking the next.
+    #[test]
+    #[allow(unsafe_code)]
+    fn a_client_no_thread_can_start_for_goes_and_the_next_is_served() {
+        if !crate::memory::in_a_child(
+            "server::tests::a_client_no_thread_can_start_for_goes_and_the_next_is_served",
+        ) {
+            return;
+        }
+        // SAFETY: mlockall takes no memory.
+        if unsafe { libc::mlockall(libc::MCL_FUTURE | libc::MCL_ONFAULT) } != 0 {
+            eprintln!("skipped: mlockall: {}", io::Error::last_os_error());
+            return;
+        }
+        let socket = std::env::temp_dir().join(format!("gptpd-full-{}.sock", std::process::id()));
+        let server = Server::start(&socket).expect("start");
+        server.publish("version 1\nclock 8c1f64.fffe.36c102\n\n".to_owned());
+        let mut first = gptp::status::Client::connect_at(&socket).expect("connect");
+        served(&server, &mut first);
+        let Some(filler) = Filler::to_the_limit() else {
+            eprintln!("skipped: RLIMIT_MEMLOCK does not bind");
+            fs::remove_file(&socket).expect("remove");
+            return;
+        };
+        let mut refused = UnixStream::connect(&socket).expect("connect");
+        refused
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let mut byte = [0];
+        let ended = io::Read::read(&mut refused, &mut byte);
+        drop(filler);
+        assert_eq!(ended.expect("dropped, not left waiting"), 0);
+        let mut next = gptp::status::Client::connect_at(&socket).expect("connect");
+        served(&server, &mut next);
         fs::remove_file(&socket).expect("remove");
     }
 }
