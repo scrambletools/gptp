@@ -361,6 +361,9 @@ impl Station {
     /// The mapping from `view`, at CLOCK_MONOTONIC time `now` in
     /// nanoseconds.
     pub fn mapping(&mut self, view: View, now: i64) -> Mapping {
+        if let Some(kept) = self.standing_in(view, now) {
+            return kept;
+        }
         let mapping = self.weighed(view, now);
         if mapping.state != State::None {
             self.lost_at = None;
@@ -369,6 +372,31 @@ impl Station {
         self.doubted = None;
         let lost_at = *self.lost_at.get_or_insert(now);
         held(self.last_timed, lost_at, now, mapping)
+    }
+
+    /// While this system stands in as grandmaster for one whose Syncs
+    /// stopped, the last line followed, kept fresh, for
+    /// [`HOLDOVER_NANOS`], as while none is heard: a switch that stops
+    /// sending Sync for a moment hands back within a second or two, and
+    /// its first Sync then is weighed against the line, so one stamped
+    /// late is held back rather than starting a generation.
+    fn standing_in(&mut self, view: View, now: i64) -> Option<Mapping> {
+        if !view.ours {
+            return None;
+        }
+        let last = self
+            .last_timed
+            .filter(|last| last.state == State::Following && last.generation == self.generation)?;
+        let lost_at = *self.lost_at.get_or_insert(now);
+        if now - lost_at >= HOLDOVER_NANOS {
+            return None;
+        }
+        self.doubted = None;
+        Some(Mapping {
+            updated: now,
+            residual: None,
+            ..last
+        })
     }
 
     /// `mapping`, unless its Sync's time stands more than [`STEADY_NANOS`]
@@ -927,6 +955,72 @@ mod tests {
             station.take_steadying(),
             Some(Steadying::Stepped(moved, 11)) if (moved + 20_000).abs() < 10
         ));
+    }
+
+    /// This system standing in as grandmaster at its hardware clock's time
+    /// `local`, carrying the time on `off` nanoseconds from where it
+    /// should be.
+    fn standing_in(local: i128, off: i128) -> View {
+        View {
+            grandmaster: Some(ClockIdentity(0xa010_a3ff_fea5_1726)),
+            ours: true,
+            line: Some((
+                local,
+                5_000_000_000_000 + (local - 1_000_400_000_000) + off,
+                1.0,
+            )),
+            asymmetry_included: false,
+        }
+    }
+
+    #[test]
+    fn a_stand_in_keeps_the_line_and_a_late_first_sync_back_is_held_back() {
+        // As on the desktop: the switch stops sending Sync for a moment,
+        // this system stands in for 1.6 s, and the switch's first Sync
+        // back is stamped late.
+        let mut station = station();
+        published(&mut station, sync(0, 0), 1);
+        let before = published(&mut station, sync(1, 0), 2);
+        let stopped = 1_000_000;
+        for (step, now) in [stopped, stopped + 1_600_000_000].into_iter().enumerate() {
+            let local = 1_000_400_000_000 + 375_000_000 + step as i128 * 1_600_000_000;
+            let kept = published(&mut station, standing_in(local, -11_000), now);
+            assert_eq!(
+                (kept.state, kept.grandmaster, kept.generation),
+                (State::Following, ClockIdentity(9), 10)
+            );
+            assert_eq!((kept.local, kept.at_local), (before.local, before.at_local));
+        }
+        let back = stopped + 2_000_000_000;
+        let late = published(&mut station, sync(16, -20_000), back);
+        assert!(matches!(
+            station.take_steadying(),
+            Some(Steadying::HeldBack(moved)) if (moved + 20_000).abs() < 10
+        ));
+        assert_eq!(late.generation, 10);
+        let next = published(&mut station, sync(17, 0), back + 125_000_000);
+        assert_eq!(station.take_steadying(), Some(Steadying::Dropped));
+        assert_eq!(next.generation, 10);
+        assert_eq!(next.at_local, 5_000_000_000_000 + 17 * 125_000_000);
+    }
+
+    #[test]
+    fn a_stand_in_past_the_holdover_takes_this_systems_own_line() {
+        let mut station = station();
+        published(&mut station, sync(0, 0), 1);
+        published(&mut station, sync(1, 0), 2);
+        let stopped = 1_000_000;
+        let local = 1_000_400_000_000 + 375_000_000;
+        let kept = published(&mut station, standing_in(local, 0), stopped);
+        assert_eq!(kept.state, State::Following);
+        let local = local + HOLDOVER_NANOS as i128;
+        let own = published(
+            &mut station,
+            standing_in(local, 0),
+            stopped + HOLDOVER_NANOS,
+        );
+        assert_eq!((own.state, own.generation), (State::Grandmaster, 10));
+        assert_eq!(own.local, local);
     }
 
     #[test]

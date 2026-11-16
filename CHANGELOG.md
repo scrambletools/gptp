@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- gptpd: while this system stands in as grandmaster for one whose Syncs
+  stopped, its record keeps the line it followed, for up to 5 s as
+  while none is heard, and the first Sync back is weighed against it. A
+  switch that stops sending Sync for a moment no longer starts a
+  generation, nor, where its first Sync back was stamped late, steps
+  the time out and back.
 - gptp: `Relay::set_followed_line`, the grandmaster's time as the
   application follows it. A takeover carries it on rather than the last
   Sync's time, so a Sync the application held back, as one an I210

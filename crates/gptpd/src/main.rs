@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use gptp::dot11::Support;
 use gptp::link::Incapable;
 use gptp::relay::{Config, Destination, Event, Relay, Stamp, SystemIdentity, TimeBase};
+use gptp::time::State;
 use gptp::{ClockIdentity, DESTINATION, ETHERTYPE_GPTP, MessageType};
 use raw_ether::MacAddress;
 use raw_ether::interfaces::LinkChanges;
@@ -1484,6 +1485,16 @@ impl Daemon {
             return;
         };
         let mapping = end.station.mapping(view, monotonic);
+        if mapping.state == State::Following && !view.ours {
+            self.relay.set_followed_line(
+                mapping.grandmaster,
+                TimeBase {
+                    local: mapping.local,
+                    time: mapping.at_local,
+                    rate: mapping.local_rate,
+                },
+            );
+        }
         let recorded = self.clocks.recorded(mapping);
         if let Err(error) = end.station.write(mapping, recorded) {
             eprintln!("cannot write {}: {error}", end.station.path().display());
