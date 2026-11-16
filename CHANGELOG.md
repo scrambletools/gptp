@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- gptp: `Relay::set_followed_line`, the grandmaster's time as the
+  application follows it. A takeover carries it on rather than the last
+  Sync's time, so a Sync the application held back, as one an I210
+  stamped late, never reaches the time base.
 - gptpd: the status socket goes on taking clients where a thread for
   one cannot start: that client goes, logged, and the next is served.
   The thread taking clients ended there before, and the socket refused

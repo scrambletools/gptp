@@ -443,6 +443,9 @@ pub struct Relay {
     /// Syncs in a row from the grandmaster that came without a time
     /// stamp, since the last that came with one.
     unstamped_syncs: u32,
+    /// The grandmaster's time as the application follows it, where it
+    /// holds back Syncs it doubts: whose, and its line on the LocalClock.
+    followed_line: Option<(ClockIdentity, TimeBase)>,
     /// This system's time as grandmaster.
     time_base: TimeBase,
     /// Changes whenever this system's time base does (802.1AS-2020
@@ -518,6 +521,7 @@ impl Relay {
             synced: None,
             sync_expires: None,
             unstamped_syncs: 0,
+            followed_line: None,
             time_base: TimeBase::default(),
             time_base_indicator: 0,
             last_phase_change: 0,
@@ -558,6 +562,14 @@ impl Relay {
             self.time_base_indicator = self.time_base_indicator.wrapping_add(1);
         }
         self.time_base = time_base;
+    }
+
+    /// The grandmaster's time as the application follows it, where it
+    /// holds back a Sync it doubts, such as one a card stamped late: a
+    /// takeover from `grandmaster` carries this line on rather than the
+    /// last Sync's time, so the time base never takes a Sync held back.
+    pub fn set_followed_line(&mut self, grandmaster: ClockIdentity, line: TimeBase) {
+        self.followed_line = Some((grandmaster, line));
     }
 
     /// Changes how this system ranks, as when its priority1 is set: 255
@@ -1733,12 +1745,17 @@ impl Relay {
         if grandmaster && self.next_sync.is_none() {
             // Taking over from a grandmaster gone, carry on its time, so
             // its followers see no step: a new time base all the same.
-            if let Some((received, followed)) = followed {
-                self.time_base = TimeBase {
-                    local: received,
-                    time: time_at(&followed, received, received),
-                    rate: followed.rate_ratio,
-                };
+            let held = self
+                .followed_line
+                .filter(|(clock, _)| old_grandmaster.is_some_and(|old| old.clock == *clock))
+                .map(|(_, line)| line);
+            let last = followed.map(|(received, followed)| TimeBase {
+                local: received,
+                time: time_at(&followed, received, received),
+                rate: followed.rate_ratio,
+            });
+            if let Some(carried) = held.or(last) {
+                self.time_base = carried;
                 self.last_phase_change = 0;
                 self.last_frequency_change = 0;
             }

@@ -951,6 +951,49 @@ fn a_better_grandmaster_takes_over_and_its_time_carries_on_when_it_goes() {
     assert_ne!(indicator(&bench, Duration::from_secs(12)), Some(before));
 }
 
+/// Takes over from a grandmaster gone, the application having followed
+/// its time `off` nanoseconds from the last Sync's, as `whose` time: how
+/// far each Follow_Up sent after puts the time from the grandmaster's.
+fn taking_over_with_a_followed_line(whose: Option<ClockIdentity>, off: i128) -> Vec<i128> {
+    let mut bench = Bench::grandmaster_capable(std::vec![grandmaster(), endpoint(2, 0x30)]);
+    bench.run(Duration::from_secs(8));
+    let gm = grandmaster();
+    let (local, time, rate) = bench.relay.time_line().expect("following");
+    bench.relay.set_followed_line(
+        whose.unwrap_or(gm.identity.clock),
+        TimeBase {
+            local,
+            time: time + off,
+            rate,
+        },
+    );
+    bench.neighbors[0].announces = None;
+    bench.neighbors[0].syncs = false;
+    bench.run(Duration::from_secs(14));
+    assert!(bench.relay.is_grandmaster());
+    let follow_ups = own_follow_ups(&bench, 2, Duration::from_secs(12));
+    assert!(!follow_ups.is_empty());
+    follow_ups
+        .into_iter()
+        .map(|(left, origin)| origin - gm.clock(left))
+        .collect()
+}
+
+#[test]
+fn a_takeover_carries_on_the_line_the_application_followed() {
+    // As where the application held back the last Sync, stamped late.
+    for off in taking_over_with_a_followed_line(None, 20_000) {
+        assert!((off - 20_000).abs() < 100, "{off}");
+    }
+}
+
+#[test]
+fn a_takeover_carries_on_the_last_sync_where_the_line_followed_is_another_grandmasters() {
+    for off in taking_over_with_a_followed_line(Some(ClockIdentity(0x77)), 20_000) {
+        assert!(off.abs() < 100, "{off}");
+    }
+}
+
 #[test]
 fn priority1_255_stops_a_system_being_grandmaster() {
     let mut bench = Bench::grandmaster_capable(std::vec![endpoint(1, 0x10)]);
