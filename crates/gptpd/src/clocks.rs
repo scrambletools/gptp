@@ -29,6 +29,56 @@ const SLOW_STEERING: u64 = 20_000;
 /// resets the card: well beyond the few tens of ns comparisons stray.
 const JUMP: i128 = 1_000;
 
+/// How far a coarse clock's reading may stand from the line before it is
+/// left out. An 802.11 radio's clock reads in whole microseconds, through
+/// a read some 12 us long, so its readings stray microseconds.
+const COARSE_OFF_LINE: i128 = 4_000;
+
+/// How many readings in a row, each off the line by about as much, tell a
+/// coarse clock that was set from readings gone astray: 1 s of them.
+const COARSE_SET_AFTER: u32 = 10;
+
+/// What a coarse clock's reading says against the line.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    Take,
+    LeaveOut,
+    /// The clock was set: compare afresh from this reading.
+    Set,
+}
+
+/// A coarse clock's run of readings off the line, to tell its readings
+/// straying from its being set.
+#[derive(Debug, Default)]
+struct Outlying {
+    /// How far the run's first stood off the line, and how many so far.
+    run: Option<(i128, u32)>,
+    /// Readings left out so far.
+    left_out: u64,
+}
+
+impl Outlying {
+    /// The verdict on a reading `moved` off the line, none while the line
+    /// has no rate yet.
+    fn judge(&mut self, moved: Option<i128>) -> Verdict {
+        let Some(moved) = moved.filter(|moved| moved.abs() > COARSE_OFF_LINE) else {
+            self.run = None;
+            return Verdict::Take;
+        };
+        let (first, count) = match self.run {
+            Some((first, count)) if (moved - first).abs() <= COARSE_OFF_LINE => (first, count + 1),
+            _ => (moved, 1),
+        };
+        if count >= COARSE_SET_AFTER {
+            self.run = None;
+            return Verdict::Set;
+        }
+        self.run = Some((first, count));
+        self.left_out += 1;
+        Verdict::LeaveOut
+    }
+}
+
 /// A port's clock, as put on the LocalClock.
 enum Translation {
     /// The port's clock is the LocalClock.
@@ -41,6 +91,9 @@ enum Translation {
         slow: u64,
         /// Comparisons that failed in a row, so as to say so once.
         failing: u32,
+        /// For a coarse clock, an 802.11 radio's, its readings off the
+        /// line.
+        outlying: Option<Outlying>,
     },
 }
 
@@ -142,8 +195,14 @@ fn hardware_now(clock: &HardwareClock, offset: i128) -> i128 {
 
 impl Clocks {
     /// The clocks of `ports`, with `local`'s the LocalClock, which follows
-    /// CLOCK_TAI where `follow_tai` asks, on an end station.
-    pub fn open(ports: &[String], local: &str, follow_tai: bool) -> Result<Self, String> {
+    /// CLOCK_TAI where `follow_tai` asks, on an end station. The clocks of
+    /// `coarse` ports, 802.11 radios', read in whole microseconds.
+    pub fn open(
+        ports: &[String],
+        local: &str,
+        follow_tai: bool,
+        coarse: &[String],
+    ) -> Result<Self, String> {
         let local_index = index_of(local)?;
         let mut freed = vec![local_index];
         let (local_clock, steering, set_at_start) = if follow_tai && ports.len() == 1 {
@@ -171,6 +230,7 @@ impl Clocks {
                     spans: Spans::default(),
                     slow: 0,
                     failing: 0,
+                    outlying: coarse.contains(name).then(Outlying::default),
                 }
             };
             clocks.push(PortClock {
@@ -322,6 +382,7 @@ impl Clocks {
                 spans,
                 slow,
                 failing,
+                outlying,
             } = &mut port.translation
             else {
                 continue;
@@ -344,7 +405,31 @@ impl Clocks {
             let Some((at, offset)) = counted(read(clock, &self.local, &port.name, failing)) else {
                 continue;
             };
-            if let Some(moved) = crate::station::moved(comparison, at, offset)
+            let moved = crate::station::moved(comparison, at, offset);
+            if let Some(outlying) = outlying {
+                match outlying.judge(moved) {
+                    Verdict::Take => {}
+                    Verdict::LeaveOut => {
+                        if outlying.left_out <= 10 || crate::telling(outlying.left_out) {
+                            eprintln!(
+                                "{}: a reading of its clock {} ns off the line left out ({} so far)",
+                                port.name,
+                                moved.unwrap_or_default(),
+                                outlying.left_out
+                            );
+                        }
+                        continue;
+                    }
+                    Verdict::Set => {
+                        eprintln!(
+                            "{}: its clock moved {} ns against the LocalClock; comparing afresh",
+                            port.name,
+                            moved.unwrap_or_default()
+                        );
+                        comparison.clear();
+                    }
+                }
+            } else if let Some(moved) = moved
                 && moved.abs() > JUMP
             {
                 // Read again, to tell a clock that was set from a
@@ -420,6 +505,43 @@ fn read(
             }
             *failing += 1;
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_coarse_clock_leaves_out_a_stray_reading_and_takes_the_next() {
+        let mut outlying = Outlying::default();
+        assert_eq!(outlying.judge(None), Verdict::Take);
+        assert_eq!(outlying.judge(Some(1_200)), Verdict::Take);
+        assert_eq!(outlying.judge(Some(-3_900)), Verdict::Take);
+        assert_eq!(outlying.judge(Some(32_393)), Verdict::LeaveOut);
+        assert_eq!(outlying.judge(Some(300)), Verdict::Take);
+        assert_eq!(outlying.left_out, 1);
+        assert_eq!(outlying.run, None);
+    }
+
+    #[test]
+    fn a_coarse_clock_is_set_only_after_a_second_of_readings_off_alike() {
+        let mut outlying = Outlying::default();
+        for step in 0..COARSE_SET_AFTER - 1 {
+            let moved = 250_000 + i128::from(step % 3) * 1_000;
+            assert_eq!(outlying.judge(Some(moved)), Verdict::LeaveOut);
+        }
+        assert_eq!(outlying.judge(Some(251_500)), Verdict::Set);
+        assert_eq!(outlying.run, None);
+    }
+
+    #[test]
+    fn readings_straying_either_way_never_set_a_coarse_clock() {
+        let mut outlying = Outlying::default();
+        for step in 0..10 * COARSE_SET_AFTER {
+            let moved = if step % 2 == 0 { 5_000 } else { -5_000 };
+            assert_eq!(outlying.judge(Some(moved)), Verdict::LeaveOut);
         }
     }
 }

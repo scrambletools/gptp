@@ -1637,14 +1637,22 @@ fn run(options: Options) -> Result<(), String> {
     let follow_tai = station_settings
         .as_ref()
         .is_some_and(|(_, settings)| settings.follow_tai);
-    let mut clocks = Clocks::open(&options.ports, local, follow_tai)?;
-    clocks.compare();
     let interfaces = raw_ether::interfaces();
+    let radios: Vec<String> = options
+        .ports
+        .iter()
+        .filter(|name| {
+            interfaces
+                .iter()
+                .any(|interface| interface.name == **name && interface.wireless)
+        })
+        .cloned()
+        .collect();
+    let mut clocks = Clocks::open(&options.ports, local, follow_tai, &radios)?;
+    clocks.compare();
     let mut ports = Vec::new();
     for name in &options.ports {
-        let wireless = interfaces
-            .iter()
-            .any(|interface| interface.name == *name && interface.wireless);
+        let wireless = radios.contains(name);
         ports.push(Port {
             name: name.clone(),
             socket: open(name, options.station().is_some(), wireless)?,

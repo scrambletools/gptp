@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+- gptpd: an 802.11 port's clock is compared with the LocalClock by its
+  own rule. A radio's clock reads in whole microseconds through a read
+  some 12 us long, so the 1 us that tells a wired card's clock was set
+  restarted the comparison about 70 times an hour, each restart leaving
+  a short line that set off the next. A reading more than 4 us off the
+  line is now left out, and only a second of readings off it alike
+  restarts it.
+
 ## [0.2.2] - 2026-11-16
 
 gptpd 0.2.2's packages.
