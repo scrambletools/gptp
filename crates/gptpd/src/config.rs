@@ -1,4 +1,5 @@
 //! An end station's settings, from `/etc/gptpd/<interface>.conf`, and
+//! on a bridge an 802.11 port's `ack-offset` from its own file; and
 //! the check before it starts that no other PTP daemon holds the
 //! interface: two answering one Pdelay_Req, even once, make a strict
 //! neighbor fall back to plain PTP.
@@ -13,6 +14,10 @@ pub const PRIORITY1: u8 = 248;
 
 /// syncReceiptTimeout where the file says nothing: 802.1AS's 3.
 pub const SYNC_RECEIPT_TIMEOUT: u8 = 3;
+
+/// The largest ack-offset taken, in nanoseconds: a round trip on the air
+/// is a few microseconds at most.
+pub const ACK_OFFSET_LIMIT: u32 = 100_000;
 
 /// Which PTP profile an end station runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -41,6 +46,9 @@ pub struct Settings {
     /// How many Sync intervals with no Sync from the grandmaster before
     /// the port lets it go (802.1AS-2020 10.7.3.1, syncReceiptTimeout).
     pub sync_receipt_timeout: u8,
+    /// An 802.11 port's: nanoseconds to add to each Ack's arrival time
+    /// as its radio stamped it, for a radio that stamps Acks early.
+    pub ack_offset: i32,
 }
 
 impl Default for Settings {
@@ -51,6 +59,7 @@ impl Default for Settings {
             gptp_capable: true,
             follow_tai: false,
             sync_receipt_timeout: SYNC_RECEIPT_TIMEOUT,
+            ack_offset: 0,
         }
     }
 }
@@ -133,6 +142,18 @@ pub fn parse(text: &str) -> Result<Settings, String> {
                     .ok_or_else(|| {
                         format!(
                             "line {}: sync-receipt-timeout takes 1 to 255, not {value:?}",
+                            number + 1
+                        )
+                    })?;
+            }
+            "ack-offset" => {
+                settings.ack_offset = value
+                    .parse()
+                    .ok()
+                    .filter(|nanos: &i32| nanos.unsigned_abs() <= ACK_OFFSET_LIMIT)
+                    .ok_or_else(|| {
+                        format!(
+                            "line {}: ack-offset takes -{ACK_OFFSET_LIMIT} to {ACK_OFFSET_LIMIT} ns, not {value:?}",
                             number + 1
                         )
                     })?;
@@ -272,8 +293,13 @@ mod tests {
                 gptp_capable: true,
                 follow_tai: false,
                 sync_receipt_timeout: 3,
+                ack_offset: 0,
             })
         );
+        assert_eq!(parse("ack-offset -600").expect("settings").ack_offset, -600);
+        assert_eq!(parse("ack-offset 600").expect("settings").ack_offset, 600);
+        assert!(parse("ack-offset 100001").is_err());
+        assert!(parse("ack-offset 0.5").is_err());
         assert_eq!(
             parse("sync-receipt-timeout 16")
                 .expect("settings")

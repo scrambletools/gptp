@@ -9,6 +9,12 @@
   a short line that set off the next. A reading more than 4 us off the
   line is now left out, and only a second of readings off it alike
   restarts it.
+- gptpd: `ack-offset`, nanoseconds added to each Ack's arrival as an
+  802.11 port's radio stamped it, from /etc/gptpd/INTERFACE.conf, the
+  one setting a bridge reads from an 802.11 port's file. An AX210's FTM
+  frames come out with the Ack about 0.5 us too soon after the frame, so
+  a station measuring from them takes the round trip as below 0 and
+  drops it.
 
 ## [0.2.2] - 2026-11-16
 

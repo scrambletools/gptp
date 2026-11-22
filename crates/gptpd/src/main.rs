@@ -267,6 +267,9 @@ struct Port {
     rhythm_untold: u64,
     /// Whether the port is an 802.11 port.
     wireless: bool,
+    /// Nanoseconds added to each Ack's arrival as an 802.11 port's radio
+    /// stamped it (its file's ack-offset).
+    ack_offset: i128,
     /// An 802.11 port's radio, whose Action frames carry the timing,
     /// opened while the port is up.
     wifi: Option<WifiPort>,
@@ -812,6 +815,7 @@ impl Daemon {
     /// on the LocalClock.
     fn hear(&mut self, index: usize, heard: Heard) {
         let now = self.now();
+        let ack_offset = self.ports[index].ack_offset;
         let stamp = |time: i128| {
             self.clocks.stamp(
                 index,
@@ -844,7 +848,8 @@ impl Daemon {
                 departure,
                 ack_arrival,
             } => {
-                let (departure, ack_arrival) = (stamp(departure), stamp(ack_arrival).port);
+                let (departure, ack_arrival) =
+                    (stamp(departure), stamp(ack_arrival + ack_offset).port);
                 self.relay.handle_measurement_confirm(
                     number(index),
                     dialog_token,
@@ -1653,6 +1658,22 @@ fn run(options: Options) -> Result<(), String> {
     let mut ports = Vec::new();
     for name in &options.ports {
         let wireless = radios.contains(name);
+        let ack_offset = match (&station_settings, wireless) {
+            (_, false) => 0,
+            (Some((_, settings)), true) => settings.ack_offset,
+            // A bridge runs its other ports whatever an 802.11 port's file
+            // says.
+            (None, true) => config::load(&config::path(name)).map_or_else(
+                |error| {
+                    eprintln!("{error}; {name}'s Acks taken as stamped");
+                    0
+                },
+                |settings| settings.ack_offset,
+            ),
+        };
+        if ack_offset != 0 {
+            eprintln!("{name}: Acks taken {ack_offset} ns later than stamped");
+        }
         ports.push(Port {
             name: name.clone(),
             socket: open(name, options.station().is_some(), wireless)?,
@@ -1678,6 +1699,7 @@ fn run(options: Options) -> Result<(), String> {
             rhythm_told: 0,
             rhythm_untold: 0,
             wireless,
+            ack_offset: i128::from(ack_offset),
             wifi: None,
         });
     }
