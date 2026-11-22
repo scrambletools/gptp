@@ -34,8 +34,9 @@ const JUMP: i128 = 1_000;
 /// a read some 12 us long, so its readings stray microseconds.
 const COARSE_OFF_LINE: i128 = 4_000;
 
-/// How many readings in a row, each off the line by about as much, tell a
-/// coarse clock that was set from readings gone astray: 1 s of them.
+/// How many readings in a row off the line restart it: a second of them.
+/// A reading gone astray stands alone; a run of them means the line went
+/// astray, its clock set or its slope taken from too few readings.
 const COARSE_SET_AFTER: u32 = 10;
 
 /// How far back a coarse clock's comparisons count: over 2 s its line
@@ -51,12 +52,12 @@ enum Verdict {
     Set,
 }
 
-/// A coarse clock's run of readings off the line, to tell its readings
-/// straying from its being set.
+/// A coarse clock's readings off the line, to tell a reading gone astray
+/// from a line gone astray.
 #[derive(Debug, Default)]
 struct Outlying {
-    /// How far the run's first stood off the line, and how many so far.
-    run: Option<(i128, u32)>,
+    /// Readings off the line in a row.
+    in_a_row: u32,
     /// Readings left out so far.
     left_out: u64,
 }
@@ -65,19 +66,15 @@ impl Outlying {
     /// The verdict on a reading `moved` off the line, none while the line
     /// has no rate yet.
     fn judge(&mut self, moved: Option<i128>) -> Verdict {
-        let Some(moved) = moved.filter(|moved| moved.abs() > COARSE_OFF_LINE) else {
-            self.run = None;
+        if moved.is_none_or(|moved| moved.abs() <= COARSE_OFF_LINE) {
+            self.in_a_row = 0;
             return Verdict::Take;
-        };
-        let (first, count) = match self.run {
-            Some((first, count)) if (moved - first).abs() <= COARSE_OFF_LINE => (first, count + 1),
-            _ => (moved, 1),
-        };
-        if count >= COARSE_SET_AFTER {
-            self.run = None;
+        }
+        self.in_a_row += 1;
+        if self.in_a_row >= COARSE_SET_AFTER {
+            self.in_a_row = 0;
             return Verdict::Set;
         }
-        self.run = Some((first, count));
         self.left_out += 1;
         Verdict::LeaveOut
     }
@@ -431,7 +428,7 @@ impl Clocks {
                     }
                     Verdict::Set => {
                         eprintln!(
-                            "{}: its clock moved {} ns against the LocalClock; comparing afresh",
+                            "{}: its clock stood off the line for 1 s, {} ns now; comparing afresh",
                             port.name,
                             moved.unwrap_or_default()
                         );
@@ -531,26 +528,30 @@ mod tests {
         assert_eq!(outlying.judge(Some(32_393)), Verdict::LeaveOut);
         assert_eq!(outlying.judge(Some(300)), Verdict::Take);
         assert_eq!(outlying.left_out, 1);
-        assert_eq!(outlying.run, None);
+        assert_eq!(outlying.in_a_row, 0);
     }
 
     #[test]
-    fn a_coarse_clock_is_set_only_after_a_second_of_readings_off_alike() {
+    fn a_second_off_the_line_restarts_it_however_the_readings_stray() {
+        // 17:21:23 UTC 11-22: a line with too steep a slope, each reading
+        // further off than the last, never ten alike.
         let mut outlying = Outlying::default();
-        for step in 0..COARSE_SET_AFTER - 1 {
-            let moved = 250_000 + i128::from(step % 3) * 1_000;
+        let off = [
+            -5_228, -6_959, -11_383, -12_420, -16_211, -18_016, -21_435, -26_042, -28_319,
+        ];
+        for moved in off {
             assert_eq!(outlying.judge(Some(moved)), Verdict::LeaveOut);
         }
-        assert_eq!(outlying.judge(Some(251_500)), Verdict::Set);
-        assert_eq!(outlying.run, None);
+        assert_eq!(outlying.judge(Some(-28_988)), Verdict::Set);
+        assert_eq!(outlying.in_a_row, 0);
     }
 
     #[test]
-    fn readings_straying_either_way_never_set_a_coarse_clock() {
+    fn readings_off_the_line_now_and_then_never_restart_it() {
         let mut outlying = Outlying::default();
         for step in 0..10 * COARSE_SET_AFTER {
-            let moved = if step % 2 == 0 { 5_000 } else { -5_000 };
-            assert_eq!(outlying.judge(Some(moved)), Verdict::LeaveOut);
+            let moved = if step % 3 == 0 { 300 } else { -5_000 };
+            assert_ne!(outlying.judge(Some(moved)), Verdict::Set);
         }
     }
 }

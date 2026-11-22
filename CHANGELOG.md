@@ -7,8 +7,7 @@
   some 12 us long, so the 1 us that tells a wired card's clock was set
   restarted the comparison about 70 times an hour, each restart leaving
   a short line that set off the next. A reading more than 4 us off the
-  line is now left out, and only a second of readings off it alike
-  restarts it. Its line is fitted over 16 s rather than 2 s: over 2 s
+  line is now left out, and a second of readings off it restarts it. Its line is fitted over 16 s rather than 2 s: over 2 s
   it moved up to 1.6 us as each reading came, which a station measuring
   over FTM took as a step in the grandmaster's time.
 - raw-ether: `Comparison::keeping`, a comparison whose line is fitted
