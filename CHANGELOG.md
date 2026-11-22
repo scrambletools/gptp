@@ -8,7 +8,11 @@
   restarted the comparison about 70 times an hour, each restart leaving
   a short line that set off the next. A reading more than 4 us off the
   line is now left out, and only a second of readings off it alike
-  restarts it.
+  restarts it. Its line is fitted over 16 s rather than 2 s: over 2 s
+  it moved up to 1.6 us as each reading came, which a station measuring
+  over FTM took as a step in the grandmaster's time.
+- raw-ether: `Comparison::keeping`, a comparison whose line is fitted
+  over a span other than 2 s.
 - gptpd: `ack-offset`, nanoseconds added to each Ack's arrival as an
   802.11 port's radio stamped it, from /etc/gptpd/INTERFACE.conf, the
   one setting a bridge reads from an 802.11 port's file. An AX210's FTM

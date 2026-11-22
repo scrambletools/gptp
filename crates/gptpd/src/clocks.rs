@@ -38,6 +38,10 @@ const COARSE_OFF_LINE: i128 = 4_000;
 /// coarse clock that was set from readings gone astray: 1 s of them.
 const COARSE_SET_AFTER: u32 = 10;
 
+/// How far back a coarse clock's comparisons count: over 2 s its line
+/// moves up to 1.6 us as each reading comes, over 16 s under 0.3 us.
+const COARSE_WINDOW: Duration = Duration::from_secs(16);
+
 /// What a coarse clock's reading says against the line.
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
@@ -224,13 +228,18 @@ impl Clocks {
                     freed.push(index);
                     open_free(name, index)?
                 };
+                let coarse = coarse.contains(name);
                 Translation::Compared {
                     clock,
-                    comparison: Comparison::default(),
+                    comparison: if coarse {
+                        Comparison::keeping(COARSE_WINDOW)
+                    } else {
+                        Comparison::default()
+                    },
                     spans: Spans::default(),
                     slow: 0,
                     failing: 0,
-                    outlying: coarse.contains(name).then(Outlying::default),
+                    outlying: coarse.then(Outlying::default),
                 }
             };
             clocks.push(PortClock {

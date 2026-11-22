@@ -180,13 +180,33 @@ const SPAN: i128 = 2_000_000_000;
 /// not as at the last comparison: clocks some ppm apart drift hundreds of
 /// ns between comparisons. A line fitted through the comparisons kept
 /// gives both, so no one comparison's error carries over whole.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Comparison {
     /// (when, on the clock compared, in ns; its time less the other's)
     kept: VecDeque<(i128, i128)>,
+    /// How far back comparisons count, in ns.
+    span: i128,
+}
+
+impl Default for Comparison {
+    fn default() -> Self {
+        Self {
+            kept: VecDeque::new(),
+            span: SPAN,
+        }
+    }
 }
 
 impl Comparison {
+    /// Comparisons kept over `span` rather than 2 s, for a clock read so
+    /// coarsely that 2 s of them leave its line moving with each new one.
+    pub fn keeping(span: Duration) -> Self {
+        Self {
+            kept: VecDeque::new(),
+            span: i128::try_from(span.as_nanos()).unwrap_or(i128::MAX),
+        }
+    }
+
     /// The clock compared read `at`, and `offset` ahead of the other.
     pub fn update(&mut self, at: i128, offset: i128) {
         if self.kept.back().is_some_and(|(last, _)| at <= *last) {
@@ -196,7 +216,7 @@ impl Comparison {
         while self
             .kept
             .front()
-            .is_some_and(|(first, _)| at - first > SPAN)
+            .is_some_and(|(first, _)| at - first > self.span)
             && self.kept.len() > 2
         {
             self.kept.pop_front();
@@ -582,6 +602,22 @@ mod comparison_tests {
         let last = 19 * 100_000_000;
         let off = comparison.offset_at(last) - 19 * 600;
         assert!(off.abs() <= 15, "off by {off} ns");
+    }
+
+    #[test]
+    fn a_longer_span_keeps_older_comparisons() {
+        let mut short = Comparison::default();
+        let mut long = Comparison::keeping(Duration::from_secs(16));
+        for step in 0..100i128 {
+            short.update(step * 100_000_000, step * 600);
+            long.update(step * 100_000_000, step * 600);
+        }
+        assert_eq!(short.kept.len(), 21);
+        assert_eq!(long.kept.len(), 100);
+        long.clear();
+        long.update(0, 0);
+        long.update(20_000_000_000, 0);
+        assert_eq!(long.kept.len(), 2);
     }
 
     #[test]
