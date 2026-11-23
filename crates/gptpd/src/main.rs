@@ -649,6 +649,9 @@ struct Daemon {
     gone: Vec<usize>,
     /// What to take an 802.11 port's station to measure with, where told.
     wifi_support: Option<Support>,
+    /// Where a bridge that waits for its last grandmaster as it starts
+    /// keeps which one it was.
+    grandmaster_record: Option<PathBuf>,
 }
 
 /// A port's number in the relay, from its place among the ports.
@@ -1155,7 +1158,15 @@ impl Daemon {
         }
         while let Some(event) = self.relay.poll_event() {
             match event {
-                Event::Grandmaster(_) => self.counts.grandmaster_changes += 1,
+                Event::Grandmaster(grandmaster) => {
+                    self.counts.grandmaster_changes += 1;
+                    if let (Some(record), Some(grandmaster)) =
+                        (&self.grandmaster_record, grandmaster)
+                        && let Err(error) = record_grandmaster(record, grandmaster.clock)
+                    {
+                        eprintln!("cannot write {}: {error}", record.display());
+                    }
+                }
                 Event::SyncTimeout { port } => {
                     self.counts.sync_timeouts += 1;
                     self.changed = true;
@@ -1630,6 +1641,20 @@ fn open(name: &str, end_station: bool, wireless: bool) -> Result<StampedSocket, 
     Ok(socket)
 }
 
+/// Keeps `grandmaster` at `path`, whole through a file beside it, for the
+/// next start to wait for.
+fn record_grandmaster(path: &Path, grandmaster: ClockIdentity) -> std::io::Result<()> {
+    if std::fs::read_to_string(path).is_ok_and(|text| text.trim() == grandmaster.to_string()) {
+        return Ok(());
+    }
+    if let Some(folder) = path.parent() {
+        std::fs::create_dir_all(folder)?;
+    }
+    let partial = path.with_extension("grandmaster.new");
+    std::fs::write(&partial, format!("{grandmaster}\n"))?;
+    std::fs::rename(&partial, path)
+}
+
 fn run(options: Options) -> Result<(), String> {
     memory::lock();
     let status_path = options
@@ -1777,6 +1802,7 @@ fn run(options: Options) -> Result<(), String> {
         config.sync_receipt_timeout = end.settings.sync_receipt_timeout;
     }
     let mut relay = Relay::new(config, ports.len() as u16);
+    let mut grandmaster_record = None;
     if let Some(bridge) = &options.bridge {
         let wait = config::load(&config::path(bridge)).map_or_else(
             |error| {
@@ -1786,11 +1812,13 @@ fn run(options: Options) -> Result<(), String> {
             |settings| settings.wait_for_grandmaster,
         );
         if wait {
-            // Read before this run writes its own.
-            let followed = std::fs::read_to_string(&status_path)
+            // Not in /run/gptpd, which systemd empties as the unit stops.
+            let record = PathBuf::from(format!("/var/lib/gptpd/{bridge}.grandmaster"));
+            let followed = std::fs::read_to_string(&record)
                 .ok()
-                .and_then(|text| status::grandmaster_in(&text));
+                .and_then(|text| text.trim().parse::<ClockIdentity>().ok());
             relay.await_grandmaster(followed);
+            grandmaster_record = Some(record);
             let waited = f64::from(config.announce_receipt_timeout)
                 * 2f64.powi(i32::from(config.log_announce_interval));
             match followed {
@@ -1843,6 +1871,7 @@ fn run(options: Options) -> Result<(), String> {
         utc_offset: utc,
         gone: Vec::new(),
         wifi_support: options.wifi_support,
+        grandmaster_record,
     };
     // An 802.11 port measures no link with Pdelay: its station, once one
     // is there, with Action frames, through its radio opened as it comes up.
@@ -1996,6 +2025,28 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_last_grandmaster_is_kept_for_the_next_start() {
+        let folder = std::env::temp_dir().join(format!("gptpd-record-{}", std::process::id()));
+        let record = folder.join("br0.grandmaster");
+        let presonus = ClockIdentity(0x000a_92ff_fe02_6e05);
+        record_grandmaster(&record, presonus).expect("written");
+        record_grandmaster(&record, presonus).expect("left as it is");
+        let text = std::fs::read_to_string(&record).expect("kept");
+        assert_eq!(text, "000a92.fffe.026e05\n");
+        assert_eq!(text.trim().parse::<ClockIdentity>(), Ok(presonus));
+        let motu = ClockIdentity(0x0001_f2ff_feff_3b14);
+        record_grandmaster(&record, motu).expect("rewritten");
+        assert_eq!(
+            std::fs::read_to_string(&record)
+                .expect("kept")
+                .trim()
+                .parse::<ClockIdentity>(),
+            Ok(motu)
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
 
     #[test]
     fn a_header_is_read_even_from_a_frame_that_would_not_decode() {
