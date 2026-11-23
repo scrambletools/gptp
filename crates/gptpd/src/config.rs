@@ -1,5 +1,6 @@
 //! An end station's settings, from `/etc/gptpd/<interface>.conf`, and
-//! on a bridge an 802.11 port's `ack-offset` from its own file; and
+//! on a bridge an 802.11 port's `ack-offset` from its own file and
+//! `wait-for-grandmaster` from the bridge's; and
 //! the check before it starts that no other PTP daemon holds the
 //! interface: two answering one Pdelay_Req, even once, make a strict
 //! neighbor fall back to plain PTP.
@@ -49,6 +50,11 @@ pub struct Settings {
     /// An 802.11 port's: nanoseconds to add to each Ack's arrival time
     /// as its radio stamped it, for a radio that stamps Acks early.
     pub ack_offset: i32,
+    /// A bridge's: as it starts, take the grandmaster it followed before
+    /// at once, and any other only after three Announce intervals, so a
+    /// neighbor that made itself grandmaster meanwhile is not followed
+    /// for a moment.
+    pub wait_for_grandmaster: bool,
 }
 
 impl Default for Settings {
@@ -60,6 +66,7 @@ impl Default for Settings {
             follow_tai: false,
             sync_receipt_timeout: SYNC_RECEIPT_TIMEOUT,
             ack_offset: 0,
+            wait_for_grandmaster: false,
         }
     }
 }
@@ -157,6 +164,18 @@ pub fn parse(text: &str) -> Result<Settings, String> {
                             number + 1
                         )
                     })?;
+            }
+            "wait-for-grandmaster" => {
+                settings.wait_for_grandmaster = match value {
+                    "yes" => true,
+                    "no" => false,
+                    _ => {
+                        return Err(format!(
+                            "line {}: wait-for-grandmaster takes yes or no, not {value:?}",
+                            number + 1
+                        ));
+                    }
+                };
             }
             _ => return Err(format!("line {}: unknown setting {key}", number + 1)),
         }
@@ -294,8 +313,15 @@ mod tests {
                 follow_tai: false,
                 sync_receipt_timeout: 3,
                 ack_offset: 0,
+                wait_for_grandmaster: false,
             })
         );
+        assert!(
+            parse("wait-for-grandmaster yes")
+                .expect("settings")
+                .wait_for_grandmaster
+        );
+        assert!(parse("wait-for-grandmaster 1").is_err());
         assert_eq!(parse("ack-offset -600").expect("settings").ack_offset, -600);
         assert_eq!(parse("ack-offset 600").expect("settings").ack_offset, 600);
         assert!(parse("ack-offset 100001").is_err());

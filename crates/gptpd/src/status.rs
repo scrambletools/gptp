@@ -10,6 +10,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use gptp::ClockIdentity;
 use gptp::relay::Role;
 
 use crate::{Daemon, number};
@@ -237,6 +238,15 @@ fn lite_snapshot(
     }
 }
 
+/// The grandmaster a status file's `text` names, as one written before a
+/// restart does.
+pub fn grandmaster_in(text: &str) -> Option<ClockIdentity> {
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("grandmaster "))?;
+    line.split(',').next()?.trim().parse().ok()
+}
+
 /// Writes `text` to `path` whole, through a file beside it.
 pub fn write(path: &Path, text: &str) -> io::Result<()> {
     if let Some(folder) = path.parent() {
@@ -256,5 +266,22 @@ mod tests {
     fn times_show_in_seconds_to_the_nanosecond() {
         assert_eq!(seconds(1_793_300_000_000_000_005), "1793300000.000000005");
         assert_eq!(seconds(-1), "-0.000000001");
+    }
+
+    #[test]
+    fn the_grandmaster_is_read_back_from_a_status_file() {
+        let text = "time-aware relay, process 8893, as clock 8c1f64.fffe.36c100\n\
+                    LocalClock: enp1s0's hardware clock\n\
+                    grandmaster 000a92.fffe.026e05, priority1 246, clock class 248\n\
+                    \x20 its rate +9.067 ppm from the LocalClock's\n";
+        assert_eq!(
+            grandmaster_in(text),
+            Some(ClockIdentity(0x000a_92ff_fe02_6e05))
+        );
+        assert_eq!(
+            grandmaster_in("time-aware relay, process 1\nno grandmaster\n"),
+            None
+        );
+        assert_eq!(grandmaster_in(""), None);
     }
 }

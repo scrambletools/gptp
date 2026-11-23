@@ -1759,6 +1759,30 @@ fn run(options: Options) -> Result<(), String> {
         config.sync_receipt_timeout = end.settings.sync_receipt_timeout;
     }
     let mut relay = Relay::new(config, ports.len() as u16);
+    if let Some(bridge) = &options.bridge {
+        let wait = config::load(&config::path(bridge)).map_or_else(
+            |error| {
+                eprintln!("{error}; the first grandmaster heard is taken");
+                false
+            },
+            |settings| settings.wait_for_grandmaster,
+        );
+        if wait {
+            // Read before this run writes its own.
+            let followed = std::fs::read_to_string(&status_path)
+                .ok()
+                .and_then(|text| status::grandmaster_in(&text));
+            relay.await_grandmaster(followed);
+            let waited = f64::from(config.announce_receipt_timeout)
+                * 2f64.powi(i32::from(config.log_announce_interval));
+            match followed {
+                Some(grandmaster) => eprintln!(
+                    "grandmaster {grandmaster}, followed before, taken at once; another after {waited} s"
+                ),
+                None => eprintln!("no grandmaster followed before: one taken after {waited} s"),
+            }
+        }
+    }
     if let Some(end) = &end_station {
         let now = raw_ether::clock::monotonic_now().as_nanos() as i64;
         match end.station.earlier_line(now) {

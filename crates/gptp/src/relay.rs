@@ -464,6 +464,14 @@ pub struct Relay {
     /// the start, and from a port becoming asCapable while it does not
     /// lead. `Duration::MAX` until a port first does.
     listening_until: Duration,
+    /// The grandmaster followed before a restart, taken at once while
+    /// this system settles.
+    awaited: Option<ClockIdentity>,
+    /// Until when no other grandmaster is taken, so a neighbor that made
+    /// itself grandmaster while this system was down is not followed for
+    /// the moment before the awaited one's Announce comes. From the first
+    /// port asCapable, `Duration::MAX` until one is; zero when not asked.
+    settling_until: Duration,
     outgoing: VecDeque<Transmit>,
     events: VecDeque<Event>,
 }
@@ -528,6 +536,8 @@ impl Relay {
             last_frequency_change: 0,
             next_sync: None,
             listening_until: Duration::MAX,
+            awaited: None,
+            settling_until: Duration::ZERO,
             outgoing: VecDeque::new(),
             events: VecDeque::new(),
         }
@@ -537,6 +547,21 @@ impl Relay {
     fn listening_due(&self) -> Option<Duration> {
         (self.listening_until != Duration::ZERO && self.listening_until != Duration::MAX)
             .then_some(self.listening_until)
+    }
+
+    /// After a restart, takes `grandmaster`, the one followed before, as
+    /// soon as it is the best heard, and any other only once the Announce
+    /// receipt timeout has passed from the first port asCapable. With
+    /// none, it waits that long for whichever grandmaster.
+    pub fn await_grandmaster(&mut self, grandmaster: Option<ClockIdentity>) {
+        self.awaited = grandmaster;
+        self.settling_until = Duration::MAX;
+    }
+
+    /// When settling ends, while it is to.
+    fn settling_due(&self) -> Option<Duration> {
+        (self.settling_until != Duration::ZERO && self.settling_until != Duration::MAX)
+            .then_some(self.settling_until)
     }
 
     /// How this system ranks now: as configured, or not grandmaster
@@ -1018,7 +1043,12 @@ impl Relay {
                     port.capable_until.filter(|_| port.wireless.is_some()),
                 ]
             })
-            .chain([self.sync_expires, self.next_sync, self.listening_due()])
+            .chain([
+                self.sync_expires,
+                self.next_sync,
+                self.listening_due(),
+                self.settling_due(),
+            ])
             .flatten()
             .min()
     }
@@ -1028,6 +1058,11 @@ impl Relay {
         if self.listening_due().is_some_and(|due| due <= now) {
             // Listened long enough: from now on it may lead.
             self.listening_until = Duration::ZERO;
+            reselect = true;
+        }
+        if self.settling_due().is_some_and(|due| due <= now) {
+            // Waited long enough: the best heard is taken, whichever.
+            self.settling_until = Duration::ZERO;
             reselect = true;
         }
         for index in 0..self.ports.len() {
@@ -1701,6 +1736,11 @@ impl Relay {
                 + interval(self.config.log_announce_interval)
                     * u32::from(self.config.announce_receipt_timeout);
         }
+        if as_capable && self.settling_until == Duration::MAX {
+            self.settling_until = now
+                + interval(self.config.log_announce_interval)
+                    * u32::from(self.config.announce_receipt_timeout);
+        }
         self.select(now);
         true
     }
@@ -1724,6 +1764,12 @@ impl Relay {
             .chain([own])
             .min()
             .expect("own vector");
+        // Settling, only the awaited grandmaster is taken; another waits.
+        let best = if now < self.settling_until && Some(best.root.clock) != self.awaited {
+            own
+        } else {
+            best
+        };
         let receiver = (best != own).then_some(best.port);
         let old_grandmaster = self.grandmaster();
         if receiver != self.receiver {

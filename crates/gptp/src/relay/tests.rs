@@ -36,6 +36,8 @@ struct Neighbor {
     announces: Option<(SystemIdentity, u16, Vec<ClockIdentity>)>,
     /// Whether it sends Sync, as a grandmaster does.
     syncs: bool,
+    /// When in each second it announces, in ms.
+    announce_ms: u32,
 }
 
 impl Neighbor {
@@ -83,6 +85,7 @@ fn grandmaster() -> Neighbor {
             std::vec![clock],
         )),
         syncs: true,
+        announce_ms: 0,
     }
 }
 
@@ -99,6 +102,7 @@ fn endpoint(port: u16, low: u64) -> Neighbor {
         answers: true,
         announces: None,
         syncs: false,
+        announce_ms: 0,
     }
 }
 
@@ -197,7 +201,7 @@ impl Bench {
             self.sequence = self.sequence.wrapping_add(1);
             let neighbors = self.neighbors.clone();
             for neighbor in &neighbors {
-                if now.subsec_millis() == 0
+                if now.subsec_millis() == neighbor.announce_ms
                     && let Some((system, steps, path)) = &neighbor.announces
                 {
                     self.announce(neighbor, system, *steps, path);
@@ -1082,6 +1086,154 @@ fn with_nothing_better_heard_it_leads_once_it_has_listened() {
         "{first_sync:?}"
     );
     assert!(bench.relay.is_grandmaster());
+}
+
+/// A neighbor that made itself grandmaster while the relay was down, as
+/// a switch reaching the grandmaster only through it does: worse than
+/// [`grandmaster`], its Announce first each second.
+fn rival(port: u16) -> Neighbor {
+    let clock = ClockIdentity(0x0001_f2ff_feff_3b14);
+    Neighbor {
+        port,
+        identity: PortIdentity { clock, port: 1 },
+        rate: 1.0 - 10e-6,
+        offset: 11 * SECOND,
+        delay: 200,
+        answers: true,
+        announces: Some((
+            SystemIdentity {
+                priority1: 246,
+                clock_class: 248,
+                clock_accuracy: 0xfe,
+                offset_scaled_log_variance: 0x436a,
+                priority2: 248,
+                clock,
+            },
+            0,
+            std::vec![clock],
+        )),
+        syncs: true,
+        announce_ms: 0,
+    }
+}
+
+/// The grandmaster on port 1 and the rival on port 2, the rival's
+/// Announce the first to come after the ports become asCapable and the
+/// grandmaster's half a second later.
+fn staggered() -> Vec<Neighbor> {
+    let mut probe = Bench::new(std::vec![grandmaster(), rival(2)]);
+    let capable = first_capable(&timeline(&mut probe, Duration::from_secs(3)));
+    let rival_ms = (capable.subsec_millis() + 125) % 1_000;
+    std::vec![
+        Neighbor {
+            announce_ms: (rival_ms + 500) % 1_000,
+            ..grandmaster()
+        },
+        Neighbor {
+            announce_ms: rival_ms,
+            ..rival(2)
+        },
+    ]
+}
+
+/// Each event from the relay's start to `until`, with the step it came
+/// in.
+fn timeline(bench: &mut Bench, until: Duration) -> Vec<(Duration, Event)> {
+    let mut seen = Vec::new();
+    while bench.now < until {
+        let next = bench.now + Duration::from_millis(125);
+        bench.run(next);
+        seen.extend(bench.events().into_iter().map(|event| (bench.now, event)));
+    }
+    seen
+}
+
+/// The grandmasters taken, in turn, and when.
+fn taken(seen: &[(Duration, Event)]) -> Vec<(Duration, ClockIdentity)> {
+    seen.iter()
+        .filter_map(|(at, event)| match event {
+            Event::Grandmaster(Some(system)) => Some((*at, system.clock)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// When the first port became asCapable.
+fn first_capable(seen: &[(Duration, Event)]) -> Duration {
+    seen.iter()
+        .find(|(_, event)| {
+            matches!(
+                event,
+                Event::AsCapable {
+                    as_capable: true,
+                    ..
+                }
+            )
+        })
+        .map(|(at, _)| *at)
+        .expect("a port asCapable")
+}
+
+#[test]
+fn unasked_a_restart_follows_a_rival_for_a_moment() {
+    let mut bench = Bench::new(staggered());
+    let seen = timeline(&mut bench, Duration::from_secs(5));
+    let clocks: Vec<ClockIdentity> = taken(&seen).into_iter().map(|(_, clock)| clock).collect();
+    assert_eq!(
+        clocks,
+        [rival(2).identity.clock, grandmaster().identity.clock]
+    );
+}
+
+#[test]
+fn a_restart_waits_for_the_grandmaster_it_followed() {
+    let mut unasked = Bench::new(staggered());
+    let unasked = taken(&timeline(&mut unasked, Duration::from_secs(5)));
+    let mut bench = Bench::new(staggered());
+    bench
+        .relay
+        .await_grandmaster(Some(grandmaster().identity.clock));
+    let waited = taken(&timeline(&mut bench, Duration::from_secs(8)));
+    // Never the rival, and the grandmaster no later than unasked.
+    assert_eq!(waited.len(), 1, "{waited:?}");
+    assert_eq!(waited[0], unasked[1]);
+}
+
+#[test]
+fn with_the_awaited_grandmaster_gone_another_is_taken_once_waited() {
+    let mut bench = Bench::new(std::vec![rival(2)]);
+    bench
+        .relay
+        .await_grandmaster(Some(grandmaster().identity.clock));
+    let seen = timeline(&mut bench, Duration::from_secs(8));
+    let capable = first_capable(&seen);
+    let waited = taken(&seen);
+    assert_eq!(waited.len(), 1, "{waited:?}");
+    assert_eq!(waited[0].1, rival(2).identity.clock);
+    // Three Announce intervals after the first port became asCapable.
+    assert!(
+        waited[0].0 >= capable + Duration::from_secs(3),
+        "{waited:?}"
+    );
+    assert!(
+        waited[0].0 <= capable + Duration::from_millis(3_125),
+        "{waited:?}"
+    );
+}
+
+#[test]
+fn awaiting_none_waits_out_the_timeout_for_the_best() {
+    let mut bench = Bench::new(staggered());
+    bench.relay.await_grandmaster(None);
+    let seen = timeline(&mut bench, Duration::from_secs(8));
+    let capable = first_capable(&seen);
+    let waited = taken(&seen);
+    assert_eq!(waited.len(), 1, "{waited:?}");
+    assert_eq!(waited[0].1, grandmaster().identity.clock);
+    assert!(
+        waited[0].0 >= capable + Duration::from_secs(3),
+        "{waited:?}"
+    );
 }
 
 #[test]

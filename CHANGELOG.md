@@ -20,6 +20,16 @@
   frames carried times 4295 s off.
 - raw-ether: `Comparison::step`, moving every comparison kept with a
   clock set by a step known exactly.
+- gptp: `Relay::await_grandmaster`: after a restart, the grandmaster
+  followed before is taken as soon as it is the best heard, and any
+  other only once the Announce receipt timeout has passed from the first
+  port asCapable.
+- gptpd: `wait-for-grandmaster yes` in a bridge's own file
+  (/etc/gptpd/BRIDGE.conf) has it wait so for the grandmaster its last
+  status file names. A neighbor reaching the grandmaster only through
+  the bridge makes itself grandmaster while gptpd restarts, and was
+  followed until the grandmaster's own Announce came: 0.85 s and 27 ms
+  in two restarts. Off by default.
 - gptpd: `ack-offset`, nanoseconds added to each Ack's arrival as an
   802.11 port's radio stamped it, from /etc/gptpd/INTERFACE.conf, the
   one setting a bridge reads from an 802.11 port's file. An AX210's FTM
