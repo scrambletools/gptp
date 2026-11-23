@@ -43,6 +43,29 @@ const COARSE_SET_AFTER: u32 = 10;
 /// moves up to 1.6 us as each reading comes, over 16 s under 0.3 us.
 const COARSE_WINDOW: Duration = Duration::from_secs(16);
 
+/// What a radio's clock steps by when its driver counts a wrap of the
+/// card's 32-bit microsecond counter that never came, as iwlwifi does for
+/// a time stamp handed over more than 5 ms after a later reading.
+const COUNTER_WRAP: i128 = (1 << 32) * 1_000;
+
+/// How near whole wraps a step must come to be taken as them: beyond a
+/// slow reading's error, and nothing else steps a clock by within this of
+/// 71 minutes.
+const WRAP_SLACK: f64 = 20_000.0;
+
+/// The whole counter wraps, in ns, by which a reading `offset` at `at`
+/// stands off `comparison`'s line, if it stands off by any.
+fn wrapped(comparison: &Comparison, at: i128, offset: i128) -> Option<i128> {
+    let moved = crate::station::moved(comparison, at, offset)?;
+    let rate = comparison.rate()?;
+    // A step moves the time read and the offset alike, and the line
+    // foretells its rate times the step more at the later time.
+    let by = moved as f64 / (1.0 - rate);
+    let wraps = (by / COUNTER_WRAP as f64).round();
+    let whole = (wraps as i128).checked_mul(COUNTER_WRAP)?;
+    (whole != 0 && (by - whole as f64).abs() <= WRAP_SLACK).then_some(whole)
+}
+
 /// What a coarse clock's reading says against the line.
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
@@ -408,7 +431,20 @@ impl Clocks {
                 }
                 None
             };
-            let Some((at, offset)) = counted(read(clock, &self.local, &port.name, failing)) else {
+            let taken = read(clock, &self.local, &port.name, failing);
+            // Whole counter wraps step the line at once, a slow reading
+            // being near enough to tell them.
+            if outlying.is_some()
+                && let Some((at, reading)) = taken
+                && let Some(by) = wrapped(comparison, at, reading.offset)
+            {
+                comparison.step(by);
+                eprintln!(
+                    "{}: its clock stepped {by} ns, whole wraps of its counter; the line steps with it",
+                    port.name
+                );
+            }
+            let Some((at, offset)) = counted(taken) else {
                 continue;
             };
             let moved = crate::station::moved(comparison, at, offset);
@@ -544,6 +580,62 @@ mod tests {
         }
         assert_eq!(outlying.judge(Some(-28_988)), Verdict::Set);
         assert_eq!(outlying.in_a_row, 0);
+    }
+
+    /// A radio's line over 16 s at 7.7 ppm, and the next reading's time
+    /// and offset on it.
+    fn radio_line() -> (Comparison, i128, i128) {
+        let mut comparison = Comparison::keeping(COARSE_WINDOW);
+        for step in 0..160i128 {
+            comparison.update(step * 100_000_000, 40_000 + step * 774);
+        }
+        let at = 160 * 100_000_000;
+        (comparison, at, 40_000 + 160 * 774)
+    }
+
+    #[test]
+    fn a_counter_wrap_steps_the_line_with_it() {
+        // 00:07:47 UTC 11-23: a time stamp handed over late, and the
+        // radio's clock 2^32 us on from then.
+        let (mut comparison, at, offset) = radio_line();
+        let rate = comparison.rate();
+        let at = at + COUNTER_WRAP;
+        let offset = offset + COUNTER_WRAP;
+        assert_eq!(wrapped(&comparison, at, offset), Some(COUNTER_WRAP));
+        // As slow a reading as the radio's.
+        assert_eq!(wrapped(&comparison, at, offset + 6_300), Some(COUNTER_WRAP));
+        comparison.step(COUNTER_WRAP);
+        assert_eq!(comparison.rate(), rate);
+        let moved = crate::station::moved(&comparison, at, offset);
+        assert!(moved.is_some_and(|moved| moved.abs() <= 1), "{moved:?}");
+        assert_eq!(Outlying::default().judge(moved), Verdict::Take);
+    }
+
+    #[test]
+    fn a_wrap_back_steps_the_line_back() {
+        let (comparison, at, offset) = radio_line();
+        assert_eq!(
+            wrapped(&comparison, at - COUNTER_WRAP, offset - COUNTER_WRAP),
+            Some(-COUNTER_WRAP)
+        );
+    }
+
+    #[test]
+    fn steps_other_than_whole_wraps_are_left_to_the_line() {
+        let (comparison, at, offset) = radio_line();
+        for by in [
+            0,
+            5_000,
+            1_000_000_000,
+            COUNTER_WRAP / 2,
+            COUNTER_WRAP + 100_000,
+            COUNTER_WRAP - 100_000,
+        ] {
+            assert_eq!(wrapped(&comparison, at + by, offset + by), None, "{by}");
+        }
+        let mut fresh = Comparison::keeping(COARSE_WINDOW);
+        fresh.update(0, 0);
+        assert_eq!(wrapped(&fresh, COUNTER_WRAP, COUNTER_WRAP), None);
     }
 
     #[test]

@@ -283,6 +283,15 @@ impl Comparison {
     pub fn clear(&mut self) {
         self.kept.clear();
     }
+
+    /// The clock compared was set `by` ns on, by a step known exactly:
+    /// every comparison kept moves with it, so the line keeps its rate.
+    pub fn step(&mut self, by: i128) {
+        for (at, offset) in &mut self.kept {
+            *at += by;
+            *offset += by;
+        }
+    }
 }
 
 /// This computer's monotonic clock: the clock `std::time::Instant` reads,
@@ -618,6 +627,22 @@ mod comparison_tests {
         long.update(0, 0);
         long.update(20_000_000_000, 0);
         assert_eq!(long.kept.len(), 2);
+    }
+
+    #[test]
+    fn a_step_moves_the_line_and_keeps_its_rate() {
+        let mut comparison = Comparison::keeping(Duration::from_secs(16));
+        for step in 0..100i128 {
+            comparison.update(step * 100_000_000, 5_000 + step * 774);
+        }
+        let rate = comparison.rate();
+        let before = comparison.offset_at(10_000_000_000);
+        let by = (1 << 32) * 1_000;
+        comparison.step(by);
+        assert_eq!(comparison.rate(), rate);
+        assert_eq!(comparison.offset_at(10_000_000_000 + by), before + by);
+        comparison.update(10_000_000_000 + by, before + by);
+        assert_eq!(comparison.kept.len(), 101);
     }
 
     #[test]

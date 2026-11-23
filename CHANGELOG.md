@@ -12,6 +12,14 @@
   over FTM took as a step in the grandmaster's time.
 - raw-ether: `Comparison::keeping`, a comparison whose line is fitted
   over a span other than 2 s.
+- gptpd: an 802.11 port's line steps with its clock when the clock
+  steps by whole wraps of the card's 32-bit microsecond counter, as
+  iwlwifi's does when it counts a wrap for a time stamp handed over
+  more than 5 ms late. The line was restarted only after ten readings
+  off it, about 6 s at a radio's share of slow readings, while FTM
+  frames carried times 4295 s off.
+- raw-ether: `Comparison::step`, moving every comparison kept with a
+  clock set by a step known exactly.
 - gptpd: `ack-offset`, nanoseconds added to each Ack's arrival as an
   802.11 port's radio stamped it, from /etc/gptpd/INTERFACE.conf, the
   one setting a bridge reads from an 802.11 port's file. An AX210's FTM
