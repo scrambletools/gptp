@@ -28,6 +28,12 @@
   acked.
 - raw-ether: `Comparison::last_at`, when the clock compared read for
   the last comparison kept.
+- gptpd: `ftm-move-on SECONDS` in an 802.11 port's file: a station
+  asking for FTM takes the port from the one measured once that one has
+  sent no FTM Request for so long. The radio stamps one station's frames
+  at a time, and a station that never asked held the port for hours
+  while another's FTM went unanswered. 0, the default, keeps the first
+  station while it stays associated.
 - gptp: `Relay::await_grandmaster`: after a restart, the grandmaster
   followed before is taken as soon as it is the best heard, and any
   other only once the Announce receipt timeout has passed from the first

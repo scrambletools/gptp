@@ -20,6 +20,9 @@ pub const SYNC_RECEIPT_TIMEOUT: u8 = 3;
 /// is a few microseconds at most.
 pub const ACK_OFFSET_LIMIT: u32 = 100_000;
 
+/// The longest ftm-move-on taken, in seconds.
+pub const FTM_MOVE_ON_LIMIT: u32 = 3_600;
+
 /// Which PTP profile an end station runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Profile {
@@ -50,6 +53,11 @@ pub struct Settings {
     /// An 802.11 port's: nanoseconds to add to each Ack's arrival time
     /// as its radio stamped it, for a radio that stamps Acks early.
     pub ack_offset: i32,
+    /// An 802.11 port's: seconds the station measured may go without an
+    /// FTM Request before another station asking for FTM takes the port,
+    /// as its radio stamps one station's frames at a time; 0 keeps the
+    /// first station while it stays associated.
+    pub ftm_move_on: u32,
     /// A bridge's: as it starts, take the grandmaster it followed before
     /// at once, and any other only after three Announce intervals, so a
     /// neighbor that made itself grandmaster meanwhile is not followed
@@ -66,6 +74,7 @@ impl Default for Settings {
             follow_tai: false,
             sync_receipt_timeout: SYNC_RECEIPT_TIMEOUT,
             ack_offset: 0,
+            ftm_move_on: 0,
             wait_for_grandmaster: false,
         }
     }
@@ -161,6 +170,18 @@ pub fn parse(text: &str) -> Result<Settings, String> {
                     .ok_or_else(|| {
                         format!(
                             "line {}: ack-offset takes -{ACK_OFFSET_LIMIT} to {ACK_OFFSET_LIMIT} ns, not {value:?}",
+                            number + 1
+                        )
+                    })?;
+            }
+            "ftm-move-on" => {
+                settings.ftm_move_on = value
+                    .parse()
+                    .ok()
+                    .filter(|seconds| *seconds <= FTM_MOVE_ON_LIMIT)
+                    .ok_or_else(|| {
+                        format!(
+                            "line {}: ftm-move-on takes 0 to {FTM_MOVE_ON_LIMIT} s, not {value:?}",
                             number + 1
                         )
                     })?;
@@ -313,9 +334,13 @@ mod tests {
                 follow_tai: false,
                 sync_receipt_timeout: 3,
                 ack_offset: 0,
+                ftm_move_on: 0,
                 wait_for_grandmaster: false,
             })
         );
+        assert_eq!(parse("ftm-move-on 3").expect("settings").ftm_move_on, 3);
+        assert!(parse("ftm-move-on 3601").is_err());
+        assert!(parse("ftm-move-on -1").is_err());
         assert!(
             parse("wait-for-grandmaster yes")
                 .expect("settings")

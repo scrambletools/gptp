@@ -11,7 +11,7 @@ use std::io;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::{SocketAddr, UnixDatagram};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gptp::dot11::ftm::{ACTION_FTM, ACTION_FTM_REQUEST, CATEGORY_PUBLIC};
 use gptp::dot11::{ACTION_TIMING_MEASUREMENT, CATEGORY_UNPROTECTED_WNM, Support};
@@ -59,6 +59,33 @@ enum Advertised {
     Unknown,
 }
 
+/// When a station asking for FTM takes the port from the one measured:
+/// the radio stamps one station's frames at a time, and a station that
+/// never asks would otherwise hold it while it stays associated.
+#[derive(Debug)]
+struct MoveOn {
+    /// How long the station measured may go without an FTM Request.
+    after: Duration,
+    /// When it was chosen, or last asked for FTM.
+    asked: Instant,
+}
+
+impl MoveOn {
+    fn new(after: Duration, now: Instant) -> Self {
+        Self { after, asked: now }
+    }
+
+    /// The station measured was chosen, or asked for FTM, at `now`.
+    fn heard(&mut self, now: Instant) {
+        self.asked = now;
+    }
+
+    /// Whether another station asking for FTM at `now` takes the port.
+    fn moves(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.asked) >= self.after
+    }
+}
+
 pub struct WifiPort {
     name: String,
     radio: Radio,
@@ -75,12 +102,18 @@ pub struct WifiPort {
     unsettled: bool,
     /// Measurement frames sent: the cookie of each, and its dialog token.
     pending: VecDeque<(u64, u8)>,
+    /// Where told, when another station asking for FTM takes the port.
+    move_on: Option<MoveOn>,
 }
 
 impl WifiPort {
     /// Opens interface `name`'s radio, with the frames gPTP needs coming
     /// to it as far as no other program takes them.
-    pub fn open(name: &str, assumed: Option<Support>) -> Result<Self, String> {
+    pub fn open(
+        name: &str,
+        assumed: Option<Support>,
+        move_on: Option<Duration>,
+    ) -> Result<Self, String> {
         let fail = |error: io::Error| format!("{name}: its radio: {error}");
         let radio = Radio::open(name).map_err(fail)?;
         let access_point = radio.access_point().map_err(fail)?;
@@ -112,6 +145,7 @@ impl WifiPort {
             peer: None,
             unsettled: false,
             pending: VecDeque::new(),
+            move_on: move_on.map(|after| MoveOn::new(after, Instant::now())),
         })
     }
 
@@ -131,8 +165,16 @@ impl WifiPort {
             .peer
             .filter(|peer| self.stations.contains(peer))
             .or_else(|| self.stations.first().copied());
+        self.measure(chosen)
+    }
+
+    /// Measures `chosen` from now, if it is not the station measured.
+    fn measure(&mut self, chosen: Option<MacAddress>) -> Option<Heard> {
         if chosen == self.peer {
             return None;
+        }
+        if let Some(move_on) = self.move_on.as_mut() {
+            move_on.heard(Instant::now());
         }
         if let Some(old) = self.peer.take()
             && let Err(error) = self.radio.set_hw_timestamp(old, false)
@@ -228,10 +270,31 @@ impl WifiPort {
                     received,
                     ack_sent,
                 } => {
+                    let request = action.starts_with(&[CATEGORY_PUBLIC, ACTION_FTM_REQUEST]);
                     if Some(source) != self.peer {
+                        let now = Instant::now();
+                        if request
+                            && self.stations.contains(&source)
+                            && self
+                                .move_on
+                                .as_ref()
+                                .is_some_and(|move_on| move_on.moves(now))
+                        {
+                            if let Some(peer) = self.peer {
+                                eprintln!(
+                                    "{}: {source} asks for FTM, {peer} has not lately",
+                                    self.name
+                                );
+                            }
+                            heard.extend(self.measure(Some(source)));
+                            heard.push(Heard::FtmRequest(action));
+                        }
                         continue;
                     }
-                    if action.starts_with(&[CATEGORY_PUBLIC, ACTION_FTM_REQUEST]) {
+                    if request {
+                        if let Some(move_on) = self.move_on.as_mut() {
+                            move_on.heard(Instant::now());
+                        }
                         heard.push(Heard::FtmRequest(action));
                     } else if let (Some(arrival), Some(ack_departure)) = (received, ack_sent) {
                         heard.push(Heard::Measurement {
@@ -432,6 +495,19 @@ pub fn parse_support(text: &str) -> Option<Support> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_station_asking_for_ftm_takes_the_port_from_one_gone_quiet() {
+        let start = Instant::now();
+        let mut move_on = MoveOn::new(Duration::from_secs(3), start);
+        // Just chosen, the station measured has its while to ask.
+        assert!(!move_on.moves(start + Duration::from_secs(2)));
+        move_on.heard(start + Duration::from_secs(2));
+        assert!(!move_on.moves(start + Duration::from_millis(4_999)));
+        assert!(move_on.moves(start + Duration::from_secs(5)));
+        // A clock read out of order moves nothing.
+        assert!(!move_on.moves(start));
+    }
 
     #[test]
     fn extended_capabilities_say_which_ways_a_station_takes_part_in() {

@@ -270,6 +270,9 @@ struct Port {
     /// Nanoseconds added to each Ack's arrival as an 802.11 port's radio
     /// stamped it (its file's ack-offset).
     ack_offset: i128,
+    /// How long an 802.11 port's station may go without an FTM Request
+    /// before another asking takes the port (its file's ftm-move-on).
+    ftm_move_on: Option<Duration>,
     /// An 802.11 port's radio, whose Action frames carry the timing,
     /// opened while the port is up.
     wifi: Option<WifiPort>,
@@ -759,7 +762,7 @@ impl Daemon {
     fn open_radio(&mut self, index: usize) {
         let now = self.now();
         let port = &mut self.ports[index];
-        let mut wifi = match WifiPort::open(&port.name, self.wifi_support) {
+        let mut wifi = match WifiPort::open(&port.name, self.wifi_support, port.ftm_move_on) {
             Ok(wifi) => wifi,
             Err(error) => {
                 eprintln!("{error}");
@@ -1701,21 +1704,29 @@ fn run(options: Options) -> Result<(), String> {
     let mut ports = Vec::new();
     for name in &options.ports {
         let wireless = radios.contains(name);
-        let ack_offset = match (&station_settings, wireless) {
-            (_, false) => 0,
-            (Some((_, settings)), true) => settings.ack_offset,
-            // A bridge runs its other ports whatever an 802.11 port's file
-            // says.
-            (None, true) => config::load(&config::path(name)).map_or_else(
-                |error| {
-                    eprintln!("{error}; {name}'s Acks taken as stamped");
-                    0
-                },
-                |settings| settings.ack_offset,
-            ),
+        // A bridge runs its other ports whatever an 802.11 port's file
+        // says.
+        let radio_settings = match (&station_settings, wireless) {
+            (_, false) => None,
+            (Some((_, settings)), true) => Some(*settings),
+            (None, true) => Some(config::load(&config::path(name)).unwrap_or_else(|error| {
+                eprintln!("{error}; {name}'s Acks taken as stamped, its first station kept");
+                config::Settings::default()
+            })),
         };
+        let ack_offset = radio_settings.map_or(0, |settings| settings.ack_offset);
         if ack_offset != 0 {
             eprintln!("{name}: Acks taken {ack_offset} ns later than stamped");
+        }
+        let ftm_move_on = radio_settings
+            .map(|settings| settings.ftm_move_on)
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| Duration::from_secs(u64::from(seconds)));
+        if let Some(after) = ftm_move_on {
+            eprintln!(
+                "{name}: a station asking for FTM takes the port from one silent {} s",
+                after.as_secs()
+            );
         }
         ports.push(Port {
             name: name.clone(),
@@ -1743,6 +1754,7 @@ fn run(options: Options) -> Result<(), String> {
             rhythm_untold: 0,
             wireless,
             ack_offset: i128::from(ack_offset),
+            ftm_move_on,
             wifi: None,
         });
     }
