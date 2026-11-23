@@ -66,6 +66,19 @@ fn wrapped(comparison: &Comparison, at: i128, offset: i128) -> Option<i128> {
     (whole != 0 && (by - whole as f64).abs() <= WRAP_SLACK).then_some(whole)
 }
 
+/// How far a radio's time stamp may stand from its clock's last reading
+/// kept and still be on the clock as read: a stamp is a moment old, and
+/// whole counter wraps put one 71 minutes on.
+const STAMP_REACH: i128 = 10_000_000_000;
+
+/// Whether any of `times` stands beyond [`STAMP_REACH`] from the clock's
+/// last reading in `comparison`.
+fn beyond_reach(comparison: &Comparison, times: &[i128]) -> bool {
+    comparison
+        .last_at()
+        .is_some_and(|last| times.iter().any(|time| (time - last).abs() > STAMP_REACH))
+}
+
 /// What a coarse clock's reading says against the line.
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
@@ -118,6 +131,8 @@ enum Translation {
         /// For a coarse clock, an 802.11 radio's, its readings off the
         /// line.
         outlying: Option<Outlying>,
+        /// Time stamps left out as far from the clock's readings.
+        stale: u64,
     },
 }
 
@@ -260,6 +275,7 @@ impl Clocks {
                     slow: 0,
                     failing: 0,
                     outlying: coarse.then(Outlying::default),
+                    stale: 0,
                 }
             };
             clocks.push(PortClock {
@@ -404,93 +420,139 @@ impl Clocks {
 
     /// Compares each port's clock with the LocalClock once more.
     pub fn compare(&mut self) {
-        for port in &mut self.ports {
-            let Translation::Compared {
-                clock,
-                comparison,
-                spans,
-                slow,
-                failing,
-                outlying,
-            } = &mut port.translation
-            else {
-                continue;
-            };
-            // A slow reading counts towards neither the line nor a jump.
-            let mut counted = |read: Option<(i128, Reading)>| {
-                let (at, reading) = read?;
-                if spans.counts(reading, SLOW_TIGHT) {
-                    return Some((at, reading.offset));
-                }
-                *slow += 1;
-                if *slow <= 10 || crate::telling(*slow) {
-                    eprintln!(
-                        "{}: a slow reading of its clock left out, {} ns ({} so far)",
-                        port.name, reading.span, slow
-                    );
-                }
-                None
-            };
-            let taken = read(clock, &self.local, &port.name, failing);
-            // Whole counter wraps step the line at once, a slow reading
-            // being near enough to tell them.
-            if outlying.is_some()
-                && let Some((at, reading)) = taken
-                && let Some(by) = wrapped(comparison, at, reading.offset)
-            {
-                comparison.step(by);
-                eprintln!(
-                    "{}: its clock stepped {by} ns, whole wraps of its counter; the line steps with it",
-                    port.name
-                );
-            }
-            let Some((at, offset)) = counted(taken) else {
-                continue;
-            };
-            let moved = crate::station::moved(comparison, at, offset);
-            if let Some(outlying) = outlying {
-                match outlying.judge(moved) {
-                    Verdict::Take => {}
-                    Verdict::LeaveOut => {
-                        if outlying.left_out <= 10 || crate::telling(outlying.left_out) {
-                            eprintln!(
-                                "{}: a reading of its clock {} ns off the line left out ({} so far)",
-                                port.name,
-                                moved.unwrap_or_default(),
-                                outlying.left_out
-                            );
-                        }
-                        continue;
-                    }
-                    Verdict::Set => {
-                        eprintln!(
-                            "{}: its clock stood off the line for 1 s, {} ns now; comparing afresh",
-                            port.name,
-                            moved.unwrap_or_default()
-                        );
-                        comparison.clear();
-                    }
-                }
-            } else if let Some(moved) = moved
-                && moved.abs() > JUMP
-            {
-                // Read again, to tell a clock that was set from a
-                // clock misread.
-                let Some((_, again)) = counted(read(clock, &self.local, &port.name, failing))
-                else {
-                    continue;
-                };
-                if (again - offset).abs() > JUMP / 2 {
-                    continue;
-                }
-                eprintln!(
-                    "{}: its clock moved {moved} ns against the LocalClock; comparing afresh",
-                    port.name
-                );
-                comparison.clear();
-            }
-            comparison.update(at, offset);
+        for index in 0..self.ports.len() {
+            self.compare_port(index);
         }
+    }
+
+    /// Whether `times`, from port `index`'s radio, stand on its clock as
+    /// last read. Where one stands far from the last reading, as after
+    /// the driver put whole counter wraps on the clock, the port is
+    /// compared at once, so the line steps with the clock before the
+    /// times are put on the LocalClock; times still far, as from both
+    /// sides of a step, are not to be used.
+    pub fn fresh(&mut self, index: usize, times: &[i128]) -> bool {
+        let far = |clocks: &Self| match clocks.ports.get(index).map(|port| &port.translation) {
+            Some(Translation::Compared {
+                comparison,
+                outlying: Some(_),
+                ..
+            }) => beyond_reach(comparison, times),
+            _ => false,
+        };
+        if !far(self) {
+            return true;
+        }
+        self.compare_port(index);
+        if !far(self) {
+            return true;
+        }
+        if let Some(PortClock {
+            name,
+            translation: Translation::Compared { stale, .. },
+        }) = self.ports.get_mut(index)
+        {
+            *stale += 1;
+            if *stale <= 10 || crate::telling(*stale) {
+                eprintln!(
+                    "{name}: a time stamp far from its clock's readings left out ({stale} so far)"
+                );
+            }
+        }
+        false
+    }
+
+    /// Compares port `index`'s clock with the LocalClock once more.
+    fn compare_port(&mut self, index: usize) {
+        let local = &self.local;
+        let Some(port) = self.ports.get_mut(index) else {
+            return;
+        };
+        let Translation::Compared {
+            clock,
+            comparison,
+            spans,
+            slow,
+            failing,
+            outlying,
+            ..
+        } = &mut port.translation
+        else {
+            return;
+        };
+        // A slow reading counts towards neither the line nor a jump.
+        let mut counted = |read: Option<(i128, Reading)>| {
+            let (at, reading) = read?;
+            if spans.counts(reading, SLOW_TIGHT) {
+                return Some((at, reading.offset));
+            }
+            *slow += 1;
+            if *slow <= 10 || crate::telling(*slow) {
+                eprintln!(
+                    "{}: a slow reading of its clock left out, {} ns ({} so far)",
+                    port.name, reading.span, slow
+                );
+            }
+            None
+        };
+        let taken = read(clock, local, &port.name, failing);
+        // Whole counter wraps step the line at once, a slow reading
+        // being near enough to tell them.
+        if outlying.is_some()
+            && let Some((at, reading)) = taken
+            && let Some(by) = wrapped(comparison, at, reading.offset)
+        {
+            comparison.step(by);
+            eprintln!(
+                "{}: its clock stepped {by} ns, whole wraps of its counter; the line steps with it",
+                port.name
+            );
+        }
+        let Some((at, offset)) = counted(taken) else {
+            return;
+        };
+        let moved = crate::station::moved(comparison, at, offset);
+        if let Some(outlying) = outlying {
+            match outlying.judge(moved) {
+                Verdict::Take => {}
+                Verdict::LeaveOut => {
+                    if outlying.left_out <= 10 || crate::telling(outlying.left_out) {
+                        eprintln!(
+                            "{}: a reading of its clock {} ns off the line left out ({} so far)",
+                            port.name,
+                            moved.unwrap_or_default(),
+                            outlying.left_out
+                        );
+                    }
+                    return;
+                }
+                Verdict::Set => {
+                    eprintln!(
+                        "{}: its clock stood off the line for 1 s, {} ns now; comparing afresh",
+                        port.name,
+                        moved.unwrap_or_default()
+                    );
+                    comparison.clear();
+                }
+            }
+        } else if let Some(moved) = moved
+            && moved.abs() > JUMP
+        {
+            // Read again, to tell a clock that was set from a
+            // clock misread.
+            let Some((_, again)) = counted(read(clock, local, &port.name, failing)) else {
+                return;
+            };
+            if (again - offset).abs() > JUMP / 2 {
+                return;
+            }
+            eprintln!(
+                "{}: its clock moved {moved} ns against the LocalClock; comparing afresh",
+                port.name
+            );
+            comparison.clear();
+        }
+        comparison.update(at, offset);
     }
 
     /// A time on port `index`'s clock, and on the LocalClock.
@@ -636,6 +698,21 @@ mod tests {
         let mut fresh = Comparison::keeping(COARSE_WINDOW);
         fresh.update(0, 0);
         assert_eq!(wrapped(&fresh, COUNTER_WRAP, COUNTER_WRAP), None);
+    }
+
+    #[test]
+    fn a_stamp_from_after_a_wrap_is_beyond_the_line_until_it_steps() {
+        let (mut comparison, at, offset) = radio_line();
+        let stamp = at + COUNTER_WRAP - 40_000_000;
+        assert!(!beyond_reach(&comparison, &[at - 50_000_000, at]));
+        assert!(beyond_reach(&comparison, &[at, stamp]));
+        // The next reading tells the wrap, and the line steps with it.
+        let by = wrapped(&comparison, at + COUNTER_WRAP, offset + COUNTER_WRAP);
+        comparison.step(by.expect("a wrap"));
+        assert!(!beyond_reach(&comparison, &[stamp, stamp + 20_000]));
+        // A stamp from before the step, beside one from after it.
+        assert!(beyond_reach(&comparison, &[at - 30_000_000, stamp]));
+        assert!(!beyond_reach(&Comparison::default(), &[stamp]));
     }
 
     #[test]

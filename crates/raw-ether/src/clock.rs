@@ -265,6 +265,11 @@ impl Comparison {
         (spread > 0.0).then(|| (mean_at, mean_offset, covariance / spread))
     }
 
+    /// When the clock compared read for the last comparison kept, on it.
+    pub fn last_at(&self) -> Option<i128> {
+        self.kept.back().map(|(at, _)| *at)
+    }
+
     /// Whether the clocks have been compared yet.
     pub fn is_empty(&self) -> bool {
         self.kept.is_empty()
@@ -641,6 +646,7 @@ mod comparison_tests {
         comparison.step(by);
         assert_eq!(comparison.rate(), rate);
         assert_eq!(comparison.offset_at(10_000_000_000 + by), before + by);
+        assert_eq!(comparison.last_at(), Some(9_900_000_000 + by));
         comparison.update(10_000_000_000 + by, before + by);
         assert_eq!(comparison.kept.len(), 101);
     }

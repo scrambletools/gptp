@@ -20,6 +20,14 @@
   frames carried times 4295 s off.
 - raw-ether: `Comparison::step`, moving every comparison kept with a
   clock set by a step known exactly.
+- gptpd: a radio's time stamp more than 10 s from its clock's last
+  reading has the port compared at once before it is used, so a stamp
+  taken after a wrap counted between readings is put on the LocalClock
+  by the stepped line, not one 4295 s off. A frame whose times still
+  stand that far, as from both sides of the step, is taken as never
+  acked.
+- raw-ether: `Comparison::last_at`, when the clock compared read for
+  the last comparison kept.
 - gptp: `Relay::await_grandmaster`: after a restart, the grandmaster
   followed before is taken as soon as it is the best heard, and any
   other only once the Announce receipt timeout has passed from the first

@@ -815,6 +815,24 @@ impl Daemon {
     /// on the LocalClock.
     fn hear(&mut self, index: usize, heard: Heard) {
         let now = self.now();
+        let times = match &heard {
+            Heard::Measurement {
+                arrival,
+                ack_departure,
+                ..
+            } => Some([*arrival, *ack_departure]),
+            Heard::Confirm {
+                departure,
+                ack_arrival,
+                ..
+            } => Some([*departure, *ack_arrival]),
+            _ => None,
+        };
+        // A frame with a time from before the radio's clock stepped is
+        // taken as one never acked.
+        if times.is_some_and(|times| !self.clocks.fresh(index, &times)) {
+            return;
+        }
         let ack_offset = self.ports[index].ack_offset;
         let stamp = |time: i128| {
             self.clocks.stamp(
