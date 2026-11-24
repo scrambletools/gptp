@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-24
+
+gptpd 0.2.3's packages.
+
 - gptpd: `ftm-share yes` in an access point's 802.11 port's file
   answers every associated station asking for FTM, one burst at a time,
   the radio's stamping moved to the station each burst goes to. A
@@ -17,9 +21,10 @@
   some 12 us long, so the 1 us that tells a wired card's clock was set
   restarted the comparison about 70 times an hour, each restart leaving
   a short line that set off the next. A reading more than 4 us off the
-  line is now left out, and a second of readings off it restarts it. Its line is fitted over 16 s rather than 2 s: over 2 s
-  it moved up to 1.6 us as each reading came, which a station measuring
-  over FTM took as a step in the grandmaster's time.
+  line is now left out, and a second of readings off it restarts it.
+  Its line is fitted over 16 s rather than 2 s: over 2 s it moved up
+  to 1.6 us as each reading came, which a station measuring over FTM
+  took as a step in the grandmaster's time.
 - raw-ether: `Comparison::keeping`, a comparison whose line is fitted
   over a span other than 2 s.
 - gptpd: an 802.11 port's line steps with its clock when the clock
