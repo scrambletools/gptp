@@ -1,14 +1,14 @@
 [package]
 name = "raw-ether"
 description = "Raw Ethernet on Linux, macOS and Windows: MAC addresses, interfaces, frames with hardware time stamps, PTP hardware clocks and captures"
-version = "0.2.1"
+version = "0.2.2"
 categories = ["network-programming", "no-std"]
 keywords = ["ethernet", "raw-socket", "ptp", "timestamping", "tsn"]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-readme.workspace = true
+readme = "README.md"
 
 [lints]
 workspace = true

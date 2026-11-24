@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- gptp 0.2.2, raw-ether 0.2.2: each crate has its own README, about
+  that crate, and carries both license texts. Both took the workspace's
+  README, about gptpd, which names files not in either crate.
+
 ## [0.2.3] - 2026-11-24
 
 gptpd 0.2.3's packages.
