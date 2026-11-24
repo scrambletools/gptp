@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- gptpd: `ftm-share yes` in an access point's 802.11 port's file
+  answers every associated station asking for FTM, one burst at a time,
+  the radio's stamping moved to the station each burst goes to. A
+  station asking during another's burst is answered as it ends, if
+  within 10 ms. Moving the stamping took 0.15 ms on an AX210, and the
+  first frame after it was stamped. no, the default, answers only the
+  station measured.
+- gptp: `Relay::handle_ftm_request_from`, an FTM Request from a station
+  other than the port's own; a timetransmitter port serves the bursts
+  asked for in turn.
 - gptpd: an 802.11 port's clock is compared with the LocalClock by its
   own rule. A radio's clock reads in whole microseconds through a read
   some 12 us long, so the 1 us that tells a wired card's clock was set

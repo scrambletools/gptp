@@ -400,6 +400,12 @@ impl Responder {
         Some(frame)
     }
 
+    /// Whether a burst is under way at `now`, a frame of it still to go.
+    pub fn busy(&self, now: Duration) -> bool {
+        self.burst
+            .is_some_and(|burst| now < burst.ends && burst.sent <= burst.granted.ftms_per_burst)
+    }
+
     /// When [`poll_frame`](Self::poll_frame) is next due.
     pub fn poll_timeout(&self) -> Option<Duration> {
         let burst = self.burst?;

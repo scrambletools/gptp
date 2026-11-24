@@ -314,8 +314,21 @@ struct FollowedUp {
     link_delay: f64,
 }
 
+/// How long an FTM Request waits for another station's burst to end: its
+/// initiator asks again after 10 ms (802.1AS-2020 Figure 12-7).
+const REQUEST_WAIT: Duration = Duration::from_millis(10);
+
+/// An FTM Request waiting for another station's burst to end.
+#[derive(Debug, Clone, Copy)]
+struct Asked {
+    station: [u8; 6],
+    at: Duration,
+    request: FtmRequest,
+}
+
 /// An 802.11 port's side of 802.1AS-2020 clause 12, towards its one
-/// station.
+/// station, and as timetransmitter with FTM towards any station that asks
+/// for bursts, one burst at a time.
 #[derive(Debug, Clone)]
 struct Wireless {
     station: Option<[u8; 6]>,
@@ -323,6 +336,10 @@ struct Wireless {
     transmitter: dot11::Transmitter,
     receiver: dot11::Receiver,
     responder: ftm::Responder,
+    /// The station the responder's burst goes to.
+    serving: Option<[u8; 6]>,
+    /// Requests from other stations during a burst, each station's last.
+    asking: VecDeque<Asked>,
     initiator: ftm::Initiator,
 }
 
@@ -334,8 +351,25 @@ impl Wireless {
             transmitter: dot11::Transmitter::new(),
             receiver: dot11::Receiver::new(),
             responder: ftm::Responder::new(),
+            serving: None,
+            asking: VecDeque::new(),
             initiator: ftm::Initiator::new(log_sync_interval),
         }
+    }
+
+    /// The answer to `station`'s FTM Request. A burst to another station
+    /// than the last follows up none of that one's frames.
+    fn answer(
+        &mut self,
+        now: Duration,
+        station: [u8; 6],
+        request: &FtmRequest,
+    ) -> Option<FineTimingMeasurement> {
+        if self.serving != Some(station) {
+            self.responder.reset();
+            self.serving = Some(station);
+        }
+        self.responder.request(now, request)
     }
 
     /// Whether the port measures with FTM: when both ends take part,
@@ -419,7 +453,11 @@ impl Port {
     fn ftm_due(&self) -> Option<Duration> {
         let wireless = self.ftm()?;
         if self.role == Role::TimeTransmitter {
-            wireless.responder.poll_timeout()
+            // A request waiting is due once the burst is over.
+            wireless
+                .responder
+                .poll_timeout()
+                .or_else(|| wireless.asking.front().map(|asked| asked.at))
         } else if self.asks_for_bursts() {
             wireless.initiator.poll_timeout()
         } else {
@@ -868,6 +906,25 @@ impl Relay {
     /// Action field: on a timetransmitter port that measures with FTM, it
     /// starts a burst (802.1AS-2020 master state machine B).
     pub fn handle_ftm_request(&mut self, now: Duration, number: u16, frame: &[u8]) {
+        let station = self
+            .index(number)
+            .and_then(|index| self.ports[index].wireless.as_ref()?.station);
+        if let Some(station) = station {
+            self.handle_ftm_request_from(now, number, station, frame);
+        }
+    }
+
+    /// An FTM Request heard on 802.11 port `number` from `station`, which
+    /// may be another than the port's own, as on an access point whose
+    /// radio stamps each station's frames in turn: during another
+    /// station's burst it waits for that burst to end, for up to 10 ms.
+    pub fn handle_ftm_request_from(
+        &mut self,
+        now: Duration,
+        number: u16,
+        station: [u8; 6],
+        frame: &[u8],
+    ) {
         let Ok(request) = FtmRequest::decode(frame) else {
             return;
         };
@@ -881,10 +938,22 @@ impl Relay {
         let Some(wireless) = port.wireless.as_mut() else {
             return;
         };
-        let Some(station) = wireless.station else {
-            return;
-        };
-        if let Some(frame) = wireless.responder.request(now, &request) {
+        wireless.asking.retain(|asked| asked.station != station);
+        if wireless.serving.is_some_and(|serving| serving != station) {
+            // A request to stop withdraws only the station's own.
+            if request.trigger == 0 {
+                return;
+            }
+            if wireless.responder.busy(now) {
+                wireless.asking.push_back(Asked {
+                    station,
+                    at: now,
+                    request,
+                });
+                return;
+            }
+        }
+        if let Some(frame) = wireless.answer(now, station, &request) {
             self.outgoing
                 .push_back(fine_timing_measurement(number, station, &frame));
         }
@@ -1148,9 +1217,23 @@ impl Relay {
             return;
         };
         if role == Role::TimeTransmitter {
-            if let Some(frame) = wireless.responder.poll_frame(now) {
+            if let Some(frame) = wireless.responder.poll_frame(now)
+                && let Some(serving) = wireless.serving
+            {
                 self.outgoing
-                    .push_back(fine_timing_measurement(number, station, &frame));
+                    .push_back(fine_timing_measurement(number, serving, &frame));
+            }
+            // The burst over, the first station still waiting has its own.
+            if !wireless.responder.busy(now) {
+                wireless
+                    .asking
+                    .retain(|asked| now <= asked.at + REQUEST_WAIT);
+                if let Some(asked) = wireless.asking.pop_front()
+                    && let Some(frame) = wireless.answer(now, asked.station, &asked.request)
+                {
+                    self.outgoing
+                        .push_back(fine_timing_measurement(number, asked.station, &frame));
+                }
             }
         } else if asks && let Some(request) = wireless.initiator.poll_request(now) {
             self.outgoing.push_back(Transmit {

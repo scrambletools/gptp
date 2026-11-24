@@ -273,6 +273,9 @@ struct Port {
     /// How long an 802.11 port's station may go without an FTM Request
     /// before another asking takes the port (its file's ftm-move-on).
     ftm_move_on: Option<Duration>,
+    /// Whether every station asking for FTM is answered, one burst at a
+    /// time (its file's ftm-share).
+    ftm_share: bool,
     /// An 802.11 port's radio, whose Action frames carry the timing,
     /// opened while the port is up.
     wifi: Option<WifiPort>,
@@ -762,7 +765,12 @@ impl Daemon {
     fn open_radio(&mut self, index: usize) {
         let now = self.now();
         let port = &mut self.ports[index];
-        let mut wifi = match WifiPort::open(&port.name, self.wifi_support, port.ftm_move_on) {
+        let mut wifi = match WifiPort::open(
+            &port.name,
+            self.wifi_support,
+            port.ftm_move_on,
+            port.ftm_share,
+        ) {
             Ok(wifi) => wifi,
             Err(error) => {
                 eprintln!("{error}");
@@ -857,7 +865,10 @@ impl Daemon {
                 );
                 self.changed = true;
             }
-            Heard::FtmRequest(action) => self.relay.handle_ftm_request(now, number(index), &action),
+            Heard::FtmRequest { station, action } => {
+                self.relay
+                    .handle_ftm_request_from(now, number(index), station.0, &action);
+            }
             Heard::Measurement {
                 action,
                 arrival,
@@ -1728,6 +1739,10 @@ fn run(options: Options) -> Result<(), String> {
                 after.as_secs()
             );
         }
+        let ftm_share = radio_settings.is_some_and(|settings| settings.ftm_share);
+        if ftm_share {
+            eprintln!("{name}: every station asking for FTM answered, one burst at a time");
+        }
         ports.push(Port {
             name: name.clone(),
             socket: open(name, options.station().is_some(), wireless)?,
@@ -1755,6 +1770,7 @@ fn run(options: Options) -> Result<(), String> {
             wireless,
             ack_offset: i128::from(ack_offset),
             ftm_move_on,
+            ftm_share,
             wifi: None,
         });
     }

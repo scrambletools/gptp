@@ -1,6 +1,7 @@
 //! An end station's settings, from `/etc/gptpd/<interface>.conf`, and
-//! on a bridge an 802.11 port's `ack-offset` from its own file and
-//! `wait-for-grandmaster` from the bridge's; and
+//! on a bridge an 802.11 port's `ack-offset`, `ftm-move-on` and
+//! `ftm-share` from its own file and `wait-for-grandmaster` from the
+//! bridge's; and
 //! the check before it starts that no other PTP daemon holds the
 //! interface: two answering one Pdelay_Req, even once, make a strict
 //! neighbor fall back to plain PTP.
@@ -58,6 +59,10 @@ pub struct Settings {
     /// as its radio stamps one station's frames at a time; 0 keeps the
     /// first station while it stays associated.
     pub ftm_move_on: u32,
+    /// An access point's 802.11 port's: whether every associated station
+    /// asking for FTM is answered, not only the station measured, the
+    /// radio stamping the frames of each burst's station in turn.
+    pub ftm_share: bool,
     /// A bridge's: as it starts, take the grandmaster it followed before
     /// at once, and any other only after three Announce intervals, so a
     /// neighbor that made itself grandmaster meanwhile is not followed
@@ -75,6 +80,7 @@ impl Default for Settings {
             sync_receipt_timeout: SYNC_RECEIPT_TIMEOUT,
             ack_offset: 0,
             ftm_move_on: 0,
+            ftm_share: false,
             wait_for_grandmaster: false,
         }
     }
@@ -185,6 +191,18 @@ pub fn parse(text: &str) -> Result<Settings, String> {
                             number + 1
                         )
                     })?;
+            }
+            "ftm-share" => {
+                settings.ftm_share = match value {
+                    "yes" => true,
+                    "no" => false,
+                    _ => {
+                        return Err(format!(
+                            "line {}: ftm-share takes yes or no, not {value:?}",
+                            number + 1
+                        ));
+                    }
+                };
             }
             "wait-for-grandmaster" => {
                 settings.wait_for_grandmaster = match value {
@@ -335,9 +353,12 @@ mod tests {
                 sync_receipt_timeout: 3,
                 ack_offset: 0,
                 ftm_move_on: 0,
+                ftm_share: false,
                 wait_for_grandmaster: false,
             })
         );
+        assert!(parse("ftm-share yes").expect("settings").ftm_share);
+        assert!(parse("ftm-share 1").is_err());
         assert_eq!(parse("ftm-move-on 3").expect("settings").ftm_move_on, 3);
         assert!(parse("ftm-move-on 3601").is_err());
         assert!(parse("ftm-move-on -1").is_err());

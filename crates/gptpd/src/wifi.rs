@@ -1,10 +1,12 @@
 //! An 802.11 port (802.1AS-2020 clause 12): its radio's Action frames,
-//! through nl80211, carry gPTP's timing, and its one station, the one
-//! the radio stamps frames for, is the relay's neighbor on it. On an
-//! access point that is the first station associated; on a station, its
-//! access point. Which ways to measure the station takes part in come
-//! from its Extended Capabilities, as hostapd or wpa_supplicant holds
-//! them, unless told.
+//! through nl80211, carry gPTP's timing, and its one station is the
+//! relay's neighbor on it. On an access point that is the first station
+//! associated; on a station, its access point. Which ways to measure the
+//! station takes part in come from its Extended Capabilities, as hostapd
+//! or wpa_supplicant holds them, unless told. The radio stamps one
+//! station's frames at a time: the station's, or where an access point
+//! answers every station asking for FTM, each in turn, the one its frames
+//! go to.
 
 use std::collections::VecDeque;
 use std::io;
@@ -36,7 +38,10 @@ const CONTROL_WAIT: Duration = Duration::from_millis(500);
 pub enum Heard {
     /// The station to measure, and the ways both take part in, or none.
     Peer(Option<(MacAddress, Support)>),
-    FtmRequest(Vec<u8>),
+    FtmRequest {
+        station: MacAddress,
+        action: Vec<u8>,
+    },
     Measurement {
         action: Vec<u8>,
         arrival: i128,
@@ -97,6 +102,8 @@ pub struct WifiPort {
     assumed: Option<Support>,
     stations: Vec<MacAddress>,
     peer: Option<MacAddress>,
+    /// The station whose frames the radio stamps.
+    stamped: Option<MacAddress>,
     /// Whether the peer was chosen before it associated, the ways to
     /// measure it still to read.
     unsettled: bool,
@@ -104,6 +111,10 @@ pub struct WifiPort {
     pending: VecDeque<(u64, u8)>,
     /// Where told, when another station asking for FTM takes the port.
     move_on: Option<MoveOn>,
+    /// Where told on an access point, whether every station asking for
+    /// FTM is answered, one burst at a time, and those answered so far.
+    share: bool,
+    answered: Vec<MacAddress>,
 }
 
 impl WifiPort {
@@ -113,6 +124,7 @@ impl WifiPort {
         name: &str,
         assumed: Option<Support>,
         move_on: Option<Duration>,
+        share: bool,
     ) -> Result<Self, String> {
         let fail = |error: io::Error| format!("{name}: its radio: {error}");
         let radio = Radio::open(name).map_err(fail)?;
@@ -135,6 +147,9 @@ impl WifiPort {
             fine_timing_measurement: requests && frames,
         };
         let stations = radio.stations().map_err(fail)?;
+        if share && !access_point {
+            eprintln!("{name}: ftm-share is an access point's; not taken");
+        }
         Ok(Self {
             name: name.to_owned(),
             radio,
@@ -143,9 +158,12 @@ impl WifiPort {
             assumed,
             stations,
             peer: None,
+            stamped: None,
             unsettled: false,
             pending: VecDeque::new(),
             move_on: move_on.map(|after| MoveOn::new(after, Instant::now())),
+            share: share && access_point,
+            answered: Vec::new(),
         })
     }
 
@@ -176,25 +194,41 @@ impl WifiPort {
         if let Some(move_on) = self.move_on.as_mut() {
             move_on.heard(Instant::now());
         }
-        if let Some(old) = self.peer.take()
-            && let Err(error) = self.radio.set_hw_timestamp(old, false)
-        {
-            eprintln!("{}: stamping {old}'s frames: {error}", self.name);
-        }
+        self.peer = None;
+        // Statuses still to come would confirm the new station's tokens.
         self.pending.clear();
+        self.stamp(chosen);
         self.unsettled = false;
         let Some(peer) = chosen else {
             return Some(Heard::Peer(None));
         };
-        if let Err(error) = self.radio.set_hw_timestamp(peer, true) {
-            eprintln!("{}: stamping {peer}'s frames: {error}", self.name);
-        }
         self.peer = Some(peer);
         let support = self.measured_with(peer).unwrap_or_else(|| {
             eprintln!("{}: measuring {peer} once it has associated", self.name);
             Support::NONE
         });
         Some(Heard::Peer(Some((peer, support))))
+    }
+
+    /// Has the radio stamp `station`'s frames, and no longer another's.
+    fn stamp(&mut self, station: Option<MacAddress>) {
+        if station == self.stamped {
+            return;
+        }
+        if let Some(old) = self.stamped.take()
+            && let Err(error) = self.radio.set_hw_timestamp(old, false)
+        {
+            eprintln!("{}: stamping {old}'s frames: {error}", self.name);
+        }
+        // Frames to the one before still to report come back unstamped.
+        self.pending.clear();
+        let Some(station) = station else {
+            return;
+        };
+        if let Err(error) = self.radio.set_hw_timestamp(station, true) {
+            eprintln!("{}: stamping {station}'s frames: {error}", self.name);
+        }
+        self.stamped = Some(station);
     }
 
     /// The ways to measure a peer chosen before it associated, once it has:
@@ -259,6 +293,7 @@ impl WifiPort {
             match event {
                 Event::Station { peer, joined } => {
                     self.stations.retain(|station| *station != peer);
+                    self.answered.retain(|station| *station != peer);
                     if joined {
                         self.stations.push(peer);
                     }
@@ -272,13 +307,12 @@ impl WifiPort {
                 } => {
                     let request = action.starts_with(&[CATEGORY_PUBLIC, ACTION_FTM_REQUEST]);
                     if Some(source) != self.peer {
-                        let now = Instant::now();
-                        if request
-                            && self.stations.contains(&source)
+                        let asking = request && self.stations.contains(&source);
+                        if asking
                             && self
                                 .move_on
                                 .as_ref()
-                                .is_some_and(|move_on| move_on.moves(now))
+                                .is_some_and(|move_on| move_on.moves(Instant::now()))
                         {
                             if let Some(peer) = self.peer {
                                 eprintln!(
@@ -287,15 +321,26 @@ impl WifiPort {
                                 );
                             }
                             heard.extend(self.measure(Some(source)));
-                            heard.push(Heard::FtmRequest(action));
+                        } else if !(asking && self.share) {
+                            continue;
+                        } else if !self.answered.contains(&source) {
+                            eprintln!("{}: answering {source}'s FTM too, in turn", self.name);
+                            self.answered.push(source);
                         }
+                        heard.push(Heard::FtmRequest {
+                            station: source,
+                            action,
+                        });
                         continue;
                     }
                     if request {
                         if let Some(move_on) = self.move_on.as_mut() {
                             move_on.heard(Instant::now());
                         }
-                        heard.push(Heard::FtmRequest(action));
+                        heard.push(Heard::FtmRequest {
+                            station: source,
+                            action,
+                        });
                     } else if let (Some(arrival), Some(ack_departure)) = (received, ack_sent) {
                         heard.push(Heard::Measurement {
                             action,
@@ -343,6 +388,10 @@ impl WifiPort {
         } else {
             station
         };
+        // The radio stamps the frames of the station they go to.
+        if dialog_token.is_some() {
+            self.stamp(Some(station));
+        }
         let cookie = self.radio.send_action(station, bssid, action)?;
         if let Some(dialog_token) = dialog_token {
             self.pending.push_back((cookie, dialog_token));

@@ -1698,6 +1698,228 @@ fn an_802_11_port_answers_ftm_requests_with_the_grandmasters_time() {
     assert!(bench.sent_on(3, MessageType::Sync, after).count() >= 60);
 }
 
+/// Another station on the access point.
+const OTHER_STATION: [u8; 6] = [0xfc, 0x01, 0x2c, 0xfd, 0xe5, 0x94];
+
+/// A bench whose port 2 is an access point's 802.11 port towards
+/// STATION, both measuring with FTM, its radio 3 s behind and 12 ppm fast.
+fn ftm_access_point() -> Bench {
+    let mut bench = Bench::with_clocks(
+        std::vec![grandmaster(), endpoint(3, 0x40)],
+        [(0, 1.0), (-3 * SECOND, 1.0 + 12e-6), (0, 1.0)],
+    );
+    bench.relay.set_wireless(
+        bench.now,
+        2,
+        Some(STATION),
+        Support::FINE_TIMING_MEASUREMENT,
+    );
+    bench.drain();
+    bench
+}
+
+/// A millisecond on: the grandmaster syncs each 125 ms and announces each
+/// second, when port 2's station says it runs gPTP.
+fn tick(bench: &mut Bench) {
+    bench.now += Duration::from_millis(1);
+    let now = bench.now;
+    if now.as_millis().is_multiple_of(125) {
+        let gm = grandmaster();
+        bench.sequence = bench.sequence.wrapping_add(1);
+        if now.subsec_millis() == 0 {
+            let (system, steps, path) = gm.announces.clone().expect("announces");
+            bench.announce(&gm, &system, steps, &path);
+            bench.say_gptp_capable(&endpoint(2, 0x50));
+        }
+        bench.sync(&gm);
+    }
+}
+
+/// The FTM frames sent on port 2 from `from` on: each with when it left
+/// and the station it went to.
+fn ftm_frames(bench: &Bench, from: usize) -> Vec<(FineTimingMeasurement, i128, [u8; 6])> {
+    bench.sent[from..]
+        .iter()
+        .filter(|sent| sent.port == 2)
+        .filter_map(|sent| match sent.destination {
+            Destination::Measurement { station, .. } => Some((
+                FineTimingMeasurement::decode(&sent.frame).expect("an FTM frame"),
+                sent.left.expect("left"),
+                station,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn an_access_point_answers_each_station_asking_for_ftm_in_turn() {
+    let mut bench = ftm_access_point();
+    let radio = 1.0 + 12e-6;
+    // The port's own station asks each sync interval, and another 5 ms
+    // after it, during its burst.
+    let mut stations = [
+        (STATION, 0, ftm::Initiator::new(-3), Vec::new()),
+        (OTHER_STATION, 5, ftm::Initiator::new(-3), Vec::new()),
+    ];
+    let mut handed = 0;
+    while bench.now < Duration::from_secs(10) {
+        tick(&mut bench);
+        let now = bench.now;
+        for (station, after, initiator, _) in &mut stations {
+            if now >= Duration::from_millis(*after)
+                && let Some(request) = initiator.poll_request(now)
+            {
+                bench
+                    .relay
+                    .handle_ftm_request_from(now, 2, *station, &request.encode());
+                bench.drain();
+            }
+        }
+        bench.settle();
+        for (frame, left, to) in ftm_frames(&bench, handed) {
+            let arrived = left + AIR;
+            let (_, _, initiator, measured) = stations
+                .iter_mut()
+                .find(|(station, ..)| *station == to)
+                .expect("a station that asked");
+            if let Some(measurement) =
+                initiator.frame(now, &frame, Stamp::local(arrived), arrived + SIFS)
+            {
+                measured.push(measurement);
+            }
+        }
+        handed = bench.sent.len();
+    }
+    assert!(bench.relay.as_capable(2));
+    assert_eq!(bench.relay.role(2), Some(Role::TimeTransmitter));
+
+    // One burst at a time: a frame with another to come is followed by
+    // the next of its burst, to the same station, and follows up only a
+    // frame to it.
+    let frames = ftm_frames(&bench, 0);
+    for (at, (frame, _, to)) in frames.iter().enumerate() {
+        if frame.dialog_token != 0
+            && let Some((_, _, next)) = frames.get(at + 1)
+        {
+            assert_eq!(next, to, "a burst cut by another");
+        }
+        if frame.follow_up_dialog_token != 0 {
+            let (_, _, earlier) = frames[..at]
+                .iter()
+                .rev()
+                .find(|(earlier, ..)| earlier.dialog_token == frame.follow_up_dialog_token)
+                .expect("the frame it follows up");
+            assert_eq!(earlier, to, "another station's frame followed up");
+        }
+    }
+
+    // Each station measures the radio's rate and the air between them.
+    for (station, _, _, measured) in &stations {
+        assert!(
+            measured.len() >= 60,
+            "{station:x?}: {} measurements",
+            measured.len()
+        );
+        for measurement in &measured[2..] {
+            assert!(
+                (measurement.neighbor_rate_ratio - radio).abs() < 1e-8,
+                "rate {}",
+                measurement.neighbor_rate_ratio
+            );
+            assert!(
+                (measurement.mean_link_delay - AIR as f64).abs() < 2.0,
+                "delay {}",
+                measurement.mean_link_delay
+            );
+        }
+    }
+}
+
+#[test]
+fn a_request_waits_10_ms_at_most_for_another_stations_burst() {
+    let mut bench = ftm_access_point();
+    while bench.now < Duration::from_secs(3) {
+        tick(&mut bench);
+        bench.settle();
+    }
+    assert_eq!(bench.relay.role(2), Some(Role::TimeTransmitter));
+    let request = FtmRequest {
+        trigger: 1,
+        parameters: Some(ftm::FtmParameters::for_sync(-3, 3)),
+    }
+    .encode();
+    let to = |bench: &Bench, from: usize, station: [u8; 6]| {
+        ftm_frames(bench, from)
+            .iter()
+            .filter(|(.., to)| *to == station)
+            .count()
+    };
+    // The first station's frames go unacked, so its burst holds the radio
+    // to its end, 64 ms on.
+    bench.acks = false;
+    let start = bench.sent.len();
+    bench
+        .relay
+        .handle_ftm_request_from(bench.now, 2, STATION, &request);
+    bench.drain();
+    assert_eq!(to(&bench, start, STATION), 1);
+    tick(&mut bench);
+    bench
+        .relay
+        .handle_ftm_request_from(bench.now, 2, OTHER_STATION, &request);
+    bench.drain();
+    for _ in 0..70 {
+        tick(&mut bench);
+        bench.settle();
+    }
+    assert_eq!(to(&bench, start, OTHER_STATION), 0, "answered too late");
+
+    // Asking again with the radio free, it is answered at once.
+    bench.acks = true;
+    let again = bench.sent.len();
+    bench
+        .relay
+        .handle_ftm_request_from(bench.now, 2, OTHER_STATION, &request);
+    bench.drain();
+    assert_eq!(to(&bench, again, OTHER_STATION), 1);
+    for _ in 0..30 {
+        tick(&mut bench);
+        bench.settle();
+    }
+    assert_eq!(to(&bench, again, OTHER_STATION), 3);
+
+    // Asking within 10 ms of the burst's end, it is answered at its end.
+    let start = bench.sent.len();
+    bench.acks = false;
+    bench
+        .relay
+        .handle_ftm_request_from(bench.now, 2, STATION, &request);
+    bench.drain();
+    for _ in 0..60 {
+        tick(&mut bench);
+        bench.settle();
+    }
+    bench
+        .relay
+        .handle_ftm_request_from(bench.now, 2, OTHER_STATION, &request);
+    bench.drain();
+    assert_eq!(
+        to(&bench, start, OTHER_STATION),
+        0,
+        "answered during a burst"
+    );
+    for _ in 0..10 {
+        tick(&mut bench);
+        bench.settle();
+    }
+    assert_eq!(
+        to(&bench, start, OTHER_STATION),
+        1,
+        "not answered at the end"
+    );
+}
+
 #[test]
 fn an_802_11_timereceiver_follows_the_grandmaster_its_ftm_bursts_carry() {
     // An access point that is the grandmaster, its radio's clock its time,
