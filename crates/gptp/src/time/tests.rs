@@ -122,7 +122,7 @@ mod reader {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::super::{Reader, path};
+    use super::super::{Reader, domain_path, path};
     use super::*;
 
     fn scratch() -> PathBuf {
@@ -186,6 +186,19 @@ mod reader {
         for wrong in ["", "../etc/passwd", "a b", "sixteen-letters!"] {
             assert!(path(wrong).is_err(), "{wrong}");
         }
+    }
+
+    #[test]
+    fn a_working_clocks_mapping_lies_beside_domain_0s() {
+        assert_eq!(
+            domain_path("enp2s0", 0).expect("path"),
+            path("enp2s0").expect("path")
+        );
+        assert_eq!(
+            domain_path("enp2s0", 1).expect("path"),
+            PathBuf::from("/run/gptpd/enp2s0.d1.time")
+        );
+        assert!(domain_path("a/b", 1).is_err());
     }
 }
 

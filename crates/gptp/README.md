@@ -1,8 +1,9 @@
 # gptp
 
 IEEE 802.1AS gPTP without I/O: gPTP's messages and TLVs; the link
-(Pdelay) and the time-aware relay, which is also a one-port end station
-and may be grandmaster; gPTP over 802.11 links, by Timing Measurement or
+(Pdelay, or the Common Mean Link Delay Service) and the time-aware relay,
+which is also a one-port end station and may be grandmaster, by the BTCA
+or on a working clock's domain by configured port roles; gPTP over 802.11 links, by Timing Measurement or
 FTM; IEEE 1588's end-to-end client for the AVB Lite PTP profile, and AVB
 Lite's fallback; the time mapping applications read, and the status
 format.

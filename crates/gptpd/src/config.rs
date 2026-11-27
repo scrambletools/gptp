@@ -1,6 +1,7 @@
 //! An end station's settings, from `/etc/gptpd/<interface>.conf`, and
 //! on a bridge an 802.11 port's `ack-offset`, `ftm-move-on` and
-//! `ftm-share` from its own file and `wait-for-grandmaster` from the
+//! `ftm-share` and each port's `working-clock` from its own file, and
+//! `wait-for-grandmaster` and `working-clock-sync-interval` from the
 //! bridge's; and
 //! the check before it starts that no other PTP daemon holds the
 //! interface: two answering one Pdelay_Req, even once, make a strict
@@ -9,6 +10,8 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+
+use gptp::relay::Role;
 
 /// priority1 where the file says nothing: grandmaster capable, as Milan
 /// asks of an endpoint.
@@ -23,6 +26,13 @@ pub const ACK_OFFSET_LIMIT: u32 = 100_000;
 
 /// The longest ftm-move-on taken, in seconds.
 pub const FTM_MOVE_ON_LIMIT: u32 = 3_600;
+
+/// The working clock's domain.
+pub const WORKING_CLOCK_DOMAIN: u8 = 1;
+
+/// log2 of the seconds between the working clock's Syncs where the file
+/// says nothing: 128 a second.
+pub const WORKING_CLOCK_SYNC_INTERVAL: i8 = -7;
 
 /// Which PTP profile an end station runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -68,6 +78,12 @@ pub struct Settings {
     /// neighbor that made itself grandmaster meanwhile is not followed
     /// for a moment.
     pub wait_for_grandmaster: bool,
+    /// The port's role in the working clock, domain 1 (802.1AS-2020
+    /// 10.3.15), where it carries it; none leaves the port out of it.
+    pub working_clock: Option<Role>,
+    /// The system's: log2 of the seconds between the working clock's
+    /// Syncs.
+    pub working_clock_sync_interval: i8,
 }
 
 impl Default for Settings {
@@ -82,6 +98,8 @@ impl Default for Settings {
             ftm_move_on: 0,
             ftm_share: false,
             wait_for_grandmaster: false,
+            working_clock: None,
+            working_clock_sync_interval: WORKING_CLOCK_SYNC_INTERVAL,
         }
     }
 }
@@ -216,6 +234,33 @@ pub fn parse(text: &str) -> Result<Settings, String> {
                     }
                 };
             }
+            "working-clock" => {
+                settings.working_clock = match value {
+                    "timetransmitter" => Some(Role::TimeTransmitter),
+                    "timereceiver" => Some(Role::TimeReceiver),
+                    "passive" => Some(Role::Passive),
+                    "no" => None,
+                    _ => {
+                        return Err(format!(
+                            "line {}: working-clock takes timetransmitter, timereceiver, \
+                             passive or no, not {value:?}",
+                            number + 1
+                        ));
+                    }
+                };
+            }
+            "working-clock-sync-interval" => {
+                settings.working_clock_sync_interval = value
+                    .parse()
+                    .ok()
+                    .filter(|log: &i8| (-8..=0).contains(log))
+                    .ok_or_else(|| {
+                        format!(
+                            "line {}: working-clock-sync-interval takes -8 to 0, not {value:?}",
+                            number + 1
+                        )
+                    })?;
+            }
             _ => return Err(format!("line {}: unknown setting {key}", number + 1)),
         }
     }
@@ -341,6 +386,24 @@ mod tests {
     }
 
     #[test]
+    fn a_port_takes_a_role_in_the_working_clock() {
+        assert_eq!(Settings::default().working_clock, None);
+        for (value, role) in [
+            ("timetransmitter", Some(Role::TimeTransmitter)),
+            ("timereceiver", Some(Role::TimeReceiver)),
+            ("passive", Some(Role::Passive)),
+            ("no", None),
+        ] {
+            let settings = parse(&format!("working-clock {value}")).expect("settings");
+            assert_eq!(settings.working_clock, role, "{value}");
+        }
+        assert!(parse("working-clock leader").is_err());
+        let settings = parse("working-clock-sync-interval -6").expect("settings");
+        assert_eq!(settings.working_clock_sync_interval, -6);
+        assert!(parse("working-clock-sync-interval 1").is_err());
+    }
+
+    #[test]
     fn settings_are_lines_of_key_and_value() {
         assert_eq!(parse(""), Ok(Settings::default()));
         assert_eq!(
@@ -355,6 +418,8 @@ mod tests {
                 ftm_move_on: 0,
                 ftm_share: false,
                 wait_for_grandmaster: false,
+                working_clock: None,
+                working_clock_sync_interval: -7,
             })
         );
         assert!(parse("ftm-share yes").expect("settings").ftm_share);

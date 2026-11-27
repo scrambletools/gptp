@@ -4,7 +4,8 @@
 //!
 //! gptpd writes the mapping to `/run/gptpd/<interface>.time` at each
 //! Sync and each clock comparison, as one fixed-size record checked by a
-//! CRC. A reader reads the record whole, and reads it again when it
+//! CRC; a working clock's, of another domain, to
+//! `/run/gptpd/<interface>.d<domain>.time`. A reader reads the record whole, and reads it again when it
 //! catches it half written, so neither side needs shared memory.
 
 use core::fmt;
@@ -243,7 +244,7 @@ fn crc32(octets: &[u8]) -> u32 {
 }
 
 #[cfg(all(feature = "std", unix))]
-pub use reader::{Reader, path};
+pub use reader::{Reader, domain_path, path};
 
 #[cfg(all(feature = "std", unix))]
 mod reader {
@@ -261,6 +262,12 @@ mod reader {
 
     /// Where gptpd writes the mapping for `interface`.
     pub fn path(interface: &str) -> io::Result<PathBuf> {
+        domain_path(interface, 0)
+    }
+
+    /// Where gptpd writes the mapping of `domain` for `interface`: domain
+    /// 0's as [`path`] has it, another's beside it.
+    pub fn domain_path(interface: &str, domain: u8) -> io::Result<PathBuf> {
         if interface.is_empty()
             || interface.len() > 15
             || interface.contains(['/', '\0'])
@@ -271,7 +278,10 @@ mod reader {
                 format!("{interface:?} is not an interface name"),
             ));
         }
-        Ok(PathBuf::from(format!("/run/gptpd/{interface}.time")))
+        Ok(PathBuf::from(match domain {
+            0 => format!("/run/gptpd/{interface}.time"),
+            _ => format!("/run/gptpd/{interface}.d{domain}.time"),
+        }))
     }
 
     /// Reads gptpd's mapping for one interface, opening its file afresh
@@ -284,6 +294,12 @@ mod reader {
     impl Reader {
         pub fn open(interface: &str) -> io::Result<Self> {
             Ok(Self::at(path(interface)?))
+        }
+
+        /// A reader of `domain`'s mapping for `interface`, a working
+        /// clock's.
+        pub fn open_domain(interface: &str, domain: u8) -> io::Result<Self> {
+            Ok(Self::at(domain_path(interface, domain)?))
         }
 
         /// A reader of the record at `path`.

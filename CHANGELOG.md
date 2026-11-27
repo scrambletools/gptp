@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+- gptpd: `working-clock timetransmitter|timereceiver|passive` in a
+  port's file runs domain 1, a working clock, beside domain 0: ARB time
+  from the grandmaster's own oscillator, each port's role configured
+  with no BTCA, links measured by the Common Mean Link Delay Service 32
+  times a second and Sync 128 times a second
+  (`working-clock-sync-interval`). An end station writes its time to
+  `/run/gptpd/INTERFACE.d1.time`. Off by default; a port given no role
+  sends nothing of it.
+- gptp: `relay::Config::working_clock` and `Relay::set_external_role`,
+  externalPortConfigurationEnabled; `relay::Config`'s `domain`,
+  `ptp_timescale` and `external_port_configuration`; `link::Config`'s
+  `major_sdo_id` with `link::CMLDS`; `time::domain_path` and
+  `time::Reader::open_domain`.
 - gptp 0.2.2, raw-ether 0.2.2: each crate has its own README, about
   that crate, and carries both license texts. Both took the workspace's
   README, about gptpd, which names files not in either crate.

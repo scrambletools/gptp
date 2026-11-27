@@ -128,7 +128,13 @@ impl Station {
     /// The station for `interface`, its generation going on from what an
     /// earlier gptpd last wrote.
     pub fn open(interface: &str, clock: &HardwareClock) -> Result<Self, String> {
-        let path = gptp::time::path(interface).map_err(|error| error.to_string())?;
+        Self::open_domain(interface, 0, clock)
+    }
+
+    /// The station's mapping of `domain`, as [`Station::open`] has domain
+    /// 0's.
+    pub fn open_domain(interface: &str, domain: u8, clock: &HardwareClock) -> Result<Self, String> {
+        let path = gptp::time::domain_path(interface, domain).map_err(|error| error.to_string())?;
         let fail = |error: io::Error| format!("{}: {error}", path.display());
         if let Some(folder) = path.parent() {
             fs::create_dir_all(folder).map_err(fail)?;

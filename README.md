@@ -119,6 +119,30 @@ must have its own MAC by then.
 `docs/endpoints-plan.md` is the plan for end stations, grandmaster
 capability and the AVB Lite profile.
 
+### A working clock
+
+Off by default. A port whose file gives it `working-clock
+timetransmitter`, `timereceiver` or `passive` also runs domain 1, a
+working clock (802.1AS-2020 8.1) beside domain 0, as the robotics profile
+asks:
+
+- Its time is arbitrary (ARB), a grandmaster's own oscillator: a system
+  whose ports carrying it are all timetransmitter is its grandmaster,
+  from the LocalClock's time.
+- Each port's role is configured (externalPortConfigurationEnabled,
+  10.3.15), so no BTCA runs on it, and a timereceiver port takes the
+  first Sync without waiting for an Announce.
+- Its links are measured by the Common Mean Link Delay Service (11.2.17)
+  32 times a second, beside domain 0's own Pdelay, and it sends 128 Syncs
+  a second (`working-clock-sync-interval`, -7 by default; on a bridge in
+  the bridge's file) and 8 Announces, which name the grandmaster; until
+  the first comes, the record names clock 0. Wired back to back, the timereceiver follows within
+  some 32 ms of the link coming up.
+- A port given no role sends nothing of it, so domain 0's neighbors there
+  see nothing new. An 802.11 port carries none.
+- An end station writes it to `/run/gptpd/INTERFACE.d1.time`, as domain
+  0's record; `gptp::time::Reader::open_domain(INTERFACE, 1)` reads it.
+
 ### Either way
 
 - Links are read at once when netlink says one changed, and every 250 ms

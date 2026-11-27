@@ -137,6 +137,16 @@ pub struct Config {
     pub gptp_capable_receipt_timeout: u8,
     /// Whether ports send the gPTP-capable Signaling at all.
     pub send_gptp_capable: bool,
+    /// domainNumber of the messages sent and taken; the link's peer delay
+    /// keeps its own (domain 0).
+    pub domain: u8,
+    /// Whether the grandmaster's time is PTP's, TAI, or arbitrary (ARB).
+    pub ptp_timescale: bool,
+    /// externalPortConfigurationEnabled (802.1AS-2020 10.3.15): each
+    /// port's role is set with [`Relay::set_external_role`], no BTCA runs,
+    /// and a system with no timereceiver port is the grandmaster. A port
+    /// given no role carries nothing of the domain, its link unmeasured.
+    pub external_port_configuration: bool,
 }
 
 impl Config {
@@ -153,6 +163,43 @@ impl Config {
             log_gptp_capable_interval: 0,
             gptp_capable_receipt_timeout: 9,
             send_gptp_capable: true,
+            domain: 0,
+            ptp_timescale: true,
+            external_port_configuration: false,
+        }
+    }
+
+    /// A working clock on `domain` (802.1AS-2020 8.1 NOTE): arbitrary
+    /// time from a grandmaster's own oscillator, port roles set by
+    /// configuration, links measured by the Common Mean Link Delay Service
+    /// 32 times a second, Sync 128 times a second, and Announce 8 times a
+    /// second, so a follower soon learns whose time it takes.
+    pub fn working_clock(clock: ClockIdentity, domain: u8) -> Self {
+        let base = Self::new(clock);
+        Self {
+            identity: SystemIdentity::grandmaster_capable(clock, 248, 248),
+            link: link::Config {
+                log_interval: -5,
+                major_sdo_id: link::CMLDS,
+                ..base.link
+            },
+            log_announce_interval: -3,
+            log_sync_interval: -7,
+            utc_offset_valid: false,
+            send_gptp_capable: false,
+            domain,
+            ptp_timescale: false,
+            external_port_configuration: true,
+            ..base
+        }
+    }
+
+    /// The flags of a message sent with the domain's timescale.
+    fn timescale(&self) -> u16 {
+        if self.ptp_timescale {
+            Flags::PTP_TIMESCALE
+        } else {
+            0
         }
     }
 }
@@ -290,6 +337,7 @@ struct Relaying {
 #[derive(Debug, Clone, Copy)]
 struct Upstream {
     sequence: u16,
+    source: PortIdentity,
     received: Stamp,
     follow_up: Option<FollowedUp>,
 }
@@ -404,6 +452,9 @@ impl Wireless {
 struct Port {
     number: u16,
     link: Link,
+    /// The role configured for it, with externalPortConfigurationEnabled;
+    /// Disabled where it has none.
+    external_role: Role,
     /// An 802.11 port's side, none on a full-duplex link.
     wireless: Option<Wireless>,
     up: bool,
@@ -425,6 +476,12 @@ struct Port {
 }
 
 impl Port {
+    /// Whether the port measures its link: up, wired, and with external
+    /// port configuration given a role.
+    fn measures(&self, external: bool) -> bool {
+        self.up && self.wireless.is_none() && (!external || self.external_role != Role::Disabled)
+    }
+
     /// The 802.11 side, while the port is up towards a station it measures
     /// with FTM.
     fn ftm(&self) -> Option<&Wireless> {
@@ -541,6 +598,7 @@ impl Relay {
                     },
                     config.link,
                 ),
+                external_role: Role::Disabled,
                 wireless: None,
                 up: false,
                 as_capable: false,
@@ -669,6 +727,7 @@ impl Relay {
     /// Port `number`'s link came up or went down.
     pub fn set_port(&mut self, now: Duration, number: u16, up: bool) {
         let sends_capable = self.config.send_gptp_capable;
+        let external = self.config.external_port_configuration;
         let Some(port) = self.port_mut(number) else {
             return;
         };
@@ -676,13 +735,30 @@ impl Relay {
             return;
         }
         port.up = up;
-        port.link.set_enabled(now, up && port.wireless.is_none());
+        let measures = port.measures(external);
+        port.link.set_enabled(now, measures);
         port.next_capable = (up && sends_capable).then_some(now);
         if !up {
             port.information = None;
             port.capable_until = None;
             port.last_heard = None;
         }
+        self.check_capable(now, number);
+        self.select(now);
+    }
+
+    /// With externalPortConfigurationEnabled, port `number`'s role
+    /// (802.1AS-2020 10.3.15): TimeReceiver towards the grandmaster,
+    /// TimeTransmitter away from it, Passive, or Disabled to leave the
+    /// port out of the domain.
+    pub fn set_external_role(&mut self, now: Duration, number: u16, role: Role) {
+        let external = self.config.external_port_configuration;
+        let Some(port) = self.port_mut(number) else {
+            return;
+        };
+        port.external_role = role;
+        let measures = port.measures(external);
+        port.link.set_enabled(now, measures);
         self.check_capable(now, number);
         self.select(now);
     }
@@ -695,8 +771,7 @@ impl Relay {
             return;
         };
         let own = self.config.identity.clock;
-        if message.header.major_sdo_id != 1
-            || message.header.domain != 0
+        if !self.takes(&message.header, message.message_type())
             || message.header.source.clock == own
         {
             return;
@@ -772,8 +847,7 @@ impl Relay {
             return false;
         };
         if message.message_type() != MessageType::Sync
-            || message.header.major_sdo_id != 1
-            || message.header.domain != 0
+            || !self.takes(&message.header, MessageType::Sync)
             || message.header.source.clock == self.config.identity.clock
         {
             return false;
@@ -1087,6 +1161,7 @@ impl Relay {
         let sequence = message.header.sequence_id;
         self.upstream = Some(Upstream {
             sequence,
+            source: message.header.source,
             received: measurement.arrival,
             follow_up: Some(followed),
         });
@@ -1350,7 +1425,7 @@ impl Relay {
             header: self.header(
                 number,
                 sequence,
-                Flags::TWO_STEP | Flags::PTP_TIMESCALE,
+                Flags::TWO_STEP | self.config.timescale(),
                 SYNC_CONTROL,
                 self.config.log_sync_interval,
             ),
@@ -1493,10 +1568,13 @@ impl Relay {
         self.receiver == Some(port.number)
             && port.as_capable
             && message.header.flags.two_step()
-            && port
-                .information
-                .as_ref()
-                .is_some_and(|information| information.vector.source == message.header.source)
+            // A port configured to receive the time takes it without
+            // waiting for an Announce.
+            && (self.config.external_port_configuration
+                || port
+                    .information
+                    .as_ref()
+                    .is_some_and(|information| information.vector.source == message.header.source))
     }
 
     fn receive_sync(&mut self, now: Duration, index: usize, message: &Message, received: Stamp) {
@@ -1511,6 +1589,7 @@ impl Relay {
         let upstream = message.header.sequence_id;
         self.upstream = Some(Upstream {
             sequence: upstream,
+            source: message.header.source,
             received,
             follow_up: None,
         });
@@ -1525,12 +1604,16 @@ impl Relay {
         let Some(upstream) = self.upstream.as_mut() else {
             return;
         };
+        let from_grandmaster = if self.config.external_port_configuration {
+            upstream.source == message.header.source
+        } else {
+            port.information
+                .as_ref()
+                .is_some_and(|information| information.vector.source == message.header.source)
+        };
         if self.receiver != Some(port.number)
             || upstream.sequence != message.header.sequence_id
-            || port
-                .information
-                .as_ref()
-                .is_none_or(|information| information.vector.source != message.header.source)
+            || !from_grandmaster
         {
             return;
         }
@@ -1642,7 +1725,7 @@ impl Relay {
         let mut header = self.header(
             number,
             sequence,
-            Flags::PTP_TIMESCALE,
+            self.config.timescale(),
             FOLLOW_UP_CONTROL,
             self.config.log_sync_interval,
         );
@@ -1754,10 +1837,10 @@ impl Relay {
                     steps_removed: 0,
                     time_source: INTERNAL_OSCILLATOR,
                 },
-                if self.config.utc_offset_valid {
+                if self.config.utc_offset_valid && self.config.ptp_timescale {
                     Flags::PTP_TIMESCALE | Flags::UTC_OFFSET_VALID
                 } else {
-                    Flags::PTP_TIMESCALE
+                    self.config.timescale()
                 },
                 Vec::new(),
             ),
@@ -1832,6 +1915,10 @@ impl Relay {
     /// each asCapable port heard decides the grandmaster, the timereceiver
     /// port and every other port's role.
     fn select(&mut self, now: Duration) {
+        if self.config.external_port_configuration {
+            self.select_external(now);
+            return;
+        }
         let followed = self.synced;
         let identity = self.own_identity(now);
         let own = own_vector(identity);
@@ -1929,6 +2016,79 @@ impl Relay {
         }
     }
 
+    /// With externalPortConfigurationEnabled (802.1AS-2020 10.3.15), each
+    /// port takes the role configured while asCapable. The timereceiver
+    /// port's Announce, where one came, names the grandmaster; a system
+    /// configured with no timereceiver port is the grandmaster.
+    fn select_external(&mut self, now: Duration) {
+        let old_grandmaster = self.grandmaster();
+        let receiver = self
+            .ports
+            .iter()
+            .find(|port| port.as_capable && port.external_role == Role::TimeReceiver)
+            .map(|port| port.number);
+        if receiver != self.receiver {
+            self.upstream = None;
+            self.synced = None;
+            self.unstamped_syncs = 0;
+            self.sync_expires = receiver.map(|_| {
+                now + interval(self.config.log_sync_interval)
+                    * u32::from(self.config.sync_receipt_timeout)
+            });
+        }
+        self.receiver = receiver;
+        let leads = !self
+            .ports
+            .iter()
+            .any(|port| port.external_role == Role::TimeReceiver);
+        let heard = receiver
+            .and_then(|number| self.index(number))
+            .and_then(|index| self.ports[index].information.as_ref())
+            .map(|information| PriorityVector {
+                steps_removed: information.vector.steps_removed.saturating_add(1),
+                ..information.vector
+            });
+        self.root = match heard {
+            Some(vector) => vector,
+            None if leads => own_vector(self.config.identity),
+            // Following, before an Announce has named the grandmaster.
+            None => own_vector(SystemIdentity::not_grandmaster_capable(
+                self.config.identity.clock,
+            )),
+        };
+        let grandmaster = leads
+            && self
+                .ports
+                .iter()
+                .any(|port| port.as_capable && port.external_role == Role::TimeTransmitter);
+        if grandmaster && self.next_sync.is_none() {
+            self.time_base_indicator = self.time_base_indicator.wrapping_add(1);
+            self.next_sync = Some(now);
+        } else if !grandmaster {
+            self.next_sync = None;
+        }
+        for port in &mut self.ports {
+            let role = if port.as_capable {
+                port.external_role
+            } else {
+                Role::Disabled
+            };
+            if role != port.role {
+                port.role = role;
+                port.relaying = None;
+                port.next_announce = (role == Role::TimeTransmitter).then_some(now);
+                self.events.push_back(Event::Role {
+                    port: port.number,
+                    role,
+                });
+            }
+        }
+        let grandmaster = self.grandmaster();
+        if grandmaster != old_grandmaster {
+            self.events.push_back(Event::Grandmaster(grandmaster));
+        }
+    }
+
     fn header(
         &self,
         number: u16,
@@ -1941,7 +2101,7 @@ impl Relay {
             major_sdo_id: 1,
             minor_version: self.config.link.minor_version,
             version: 2,
-            domain: 0,
+            domain: self.config.domain,
             minor_sdo_id: 0,
             flags: Flags(flags),
             correction: 0,
@@ -1988,6 +2148,17 @@ impl Relay {
         match &port.wireless {
             Some(wireless) => port.wireless_incapable(wireless),
             None => port.link.incapable_because(),
+        }
+    }
+
+    /// Whether a message is the relay's: a peer delay message of its
+    /// link's service, on domain 0, or another message of its domain.
+    fn takes(&self, header: &Header, message_type: MessageType) -> bool {
+        match message_type {
+            MessageType::PdelayReq | MessageType::PdelayResp | MessageType::PdelayRespFollowUp => {
+                header.major_sdo_id == self.config.link.major_sdo_id && header.domain == 0
+            }
+            _ => header.major_sdo_id == 1 && header.domain == self.config.domain,
         }
     }
 
@@ -2040,3 +2211,5 @@ fn own_vector(identity: SystemIdentity) -> PriorityVector {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod working_clock_tests;

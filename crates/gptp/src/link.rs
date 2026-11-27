@@ -103,7 +103,14 @@ pub struct Config {
     /// down and up (Milan 4.2.6.2.5): a switch is flooding the requests.
     pub cease_after_multiple: u8,
     pub cease_for: Duration,
+    /// majorSdoId of the messages sent: 1 for a domain's own peer delay,
+    /// [`CMLDS`] for the Common Mean Link Delay Service (802.1AS-2020
+    /// 11.2.17), which a domain other than 0 measures its links with.
+    pub major_sdo_id: u8,
 }
+
+/// majorSdoId of the Common Mean Link Delay Service's messages.
+pub const CMLDS: u8 = 2;
 
 impl Default for Config {
     fn default() -> Self {
@@ -120,6 +127,7 @@ impl Default for Config {
             endpoint_declaration: false,
             cease_after_multiple: 3,
             cease_for: Duration::from_secs(300),
+            major_sdo_id: 1,
         }
     }
 }
@@ -561,7 +569,7 @@ impl Link {
 
     fn header(&self, sequence: u16, flags: u16, control: u8, log_interval: i8) -> Header {
         Header {
-            major_sdo_id: 1,
+            major_sdo_id: self.config.major_sdo_id,
             minor_version: self.config.minor_version,
             version: 2,
             domain: 0,

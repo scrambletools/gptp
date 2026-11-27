@@ -130,7 +130,9 @@ usage: gptpd [options] INTERFACE...
   --clock INTERFACE   the interface whose hardware clock is the LocalClock,
                       a port or not (the first port)
   --config PATH       an end station's settings
-                      (/etc/gptpd/INTERFACE.conf)
+                      (/etc/gptpd/INTERFACE.conf); a port given a
+                      working-clock role there also runs domain 1, an
+                      end station's time in /run/gptpd/INTERFACE.d1.time
   --status PATH       where to write how gPTP stands (/run/gptpd/status,
                       or /run/gptpd/INTERFACE.status for an end station)
   --check INTERFACE   exit 0 if no other PTP daemon runs on INTERFACE, or
@@ -265,6 +267,9 @@ struct Port {
     rhythm_minute: u64,
     rhythm_told: u32,
     rhythm_untold: u64,
+    /// Whether the last frame received was the working clock's, for its
+    /// relay to distrust.
+    last_received_working_clocks: bool,
     /// Whether the port is an 802.11 port.
     wireless: bool,
     /// Nanoseconds added to each Ack's arrival as an 802.11 port's radio
@@ -367,6 +372,14 @@ fn header(frame: &[u8]) -> (Option<u8>, Option<u16>) {
         .get(30..32)
         .map(|octets| u16::from_be_bytes([octets[0], octets[1]]));
     (message_type, sequence)
+}
+
+/// Whether a frame is the working clock's: of its domain, or the Common
+/// Mean Link Delay Service's.
+fn working_clocks(frame: &[u8]) -> bool {
+    let major_sdo_id = frame.first().map(|octet| octet >> 4);
+    major_sdo_id == Some(gptp::link::CMLDS)
+        || (major_sdo_id == Some(1) && frame.get(4) == Some(&config::WORKING_CLOCK_DOMAIN))
 }
 
 /// A message type's name, as the standard spells it.
@@ -629,6 +642,13 @@ struct EndStation {
     lite: Lite,
 }
 
+/// The working clock, domain 1, on the ports given a role in it: its
+/// relay and, on an end station, its mapping's writer.
+struct WorkingClock {
+    relay: Relay,
+    station: Option<Station>,
+}
+
 /// Counts since the daemon started, for the status.
 #[derive(Default)]
 struct Counts {
@@ -641,6 +661,7 @@ struct Counts {
 struct Daemon {
     identity: ClockIdentity,
     relay: Relay,
+    working_clock: Option<WorkingClock>,
     ports: Vec<Port>,
     clocks: Clocks,
     bridge: Option<String>,
@@ -744,6 +765,9 @@ impl Daemon {
                     }
                 }
                 None => self.relay.set_port(now, number(index), up),
+            }
+            if let Some(working) = &mut self.working_clock {
+                working.relay.set_port(now, number(index), up);
             }
         }
         for index in reopen {
@@ -914,7 +938,11 @@ impl Daemon {
             let stamping = received.time.map_or(Stamping::Missing, Stamping::Came);
             let arrived = self.now();
             self.ports[index].remember(arrived, frame, false, stamping);
-            self.ports[index].note_rhythm(arrived, frame, received.time);
+            // The rhythm is domain 0's: a working clock's Syncs come faster.
+            let working = self.working_clock.is_some() && working_clocks(frame);
+            if !working {
+                self.ports[index].note_rhythm(arrived, frame, received.time);
+            }
             // Sync, Delay_Req, Pdelay_Req and Pdelay_Resp: of no use
             // without the time they came.
             let event = frame.first().is_some_and(|octet| octet & 0x0f < 4);
@@ -924,6 +952,7 @@ impl Daemon {
             if received.time.is_none() && self.ports[index].stamps_every_frame {
                 self.distrust_last(index);
             }
+            self.ports[index].last_received_working_clocks = working;
             let time = match received.time {
                 Some(time) => {
                     if header(frame).0 == Some(MessageType::Sync as u8) {
@@ -935,6 +964,11 @@ impl Daemon {
                     if header(frame).0 == Some(MessageType::Sync as u8) {
                         let now = self.now();
                         self.relay.handle_unstamped_sync(now, number(index), frame);
+                        if let Some(working) = &mut self.working_clock {
+                            working
+                                .relay
+                                .handle_unstamped_sync(now, number(index), frame);
+                        }
                     }
                     self.left_unstamped(index, frame);
                     continue;
@@ -943,6 +977,9 @@ impl Daemon {
             };
             let now = self.now();
             self.relay.handle_frame(now, number(index), frame, time);
+            if let Some(working) = &mut self.working_clock {
+                working.relay.handle_frame(now, number(index), frame, time);
+            }
             if let Some(end) = &mut self.end_station {
                 end.lite.handle_frame(now, frame, time.port);
             }
@@ -1042,7 +1079,11 @@ impl Daemon {
     /// A frame on port `index` came without a time, from a card that
     /// stamps every frame: the one before it may carry its time.
     fn distrust_last(&mut self, index: usize) {
-        let Some(message_type) = self.relay.handle_unstamped(number(index)) else {
+        let relay = match &mut self.working_clock {
+            Some(working) if self.ports[index].last_received_working_clocks => &mut working.relay,
+            _ => &mut self.relay,
+        };
+        let Some(message_type) = relay.handle_unstamped(number(index)) else {
             return;
         };
         let port = &mut self.ports[index];
@@ -1060,14 +1101,26 @@ impl Daemon {
         }
     }
 
+    /// The next frame either relay has to send, with its relay's domain.
+    fn next_transmit(&mut self) -> Option<(u8, gptp::relay::Transmit)> {
+        if let Some(transmit) = self.relay.poll_transmit() {
+            return Some((0, transmit));
+        }
+        let working = self.working_clock.as_mut()?;
+        working
+            .relay
+            .poll_transmit()
+            .map(|transmit| (config::WORKING_CLOCK_DOMAIN, transmit))
+    }
+
     /// Sends what the relay has to send, giving it the time each event
     /// message left, until it has nothing more.
     fn flush(&mut self) {
         loop {
             // Event messages sent, their times still to collect: one per
             // port at a time, as a port's socket waits for one time only.
-            let mut waiting: Vec<(usize, MessageType, u16)> = Vec::new();
-            while let Some(transmit) = self.relay.poll_transmit() {
+            let mut waiting: Vec<(usize, MessageType, u16, u8)> = Vec::new();
+            while let Some((domain, transmit)) = self.next_transmit() {
                 let index = usize::from(transmit.port).wrapping_sub(1);
                 if index >= self.ports.len() {
                     continue;
@@ -1075,8 +1128,8 @@ impl Daemon {
                 if transmit.stamp.is_some()
                     && let Some(position) = waiting.iter().position(|(each, ..)| *each == index)
                 {
-                    let (index, message_type, sequence) = waiting.remove(position);
-                    self.collect(index, message_type, sequence);
+                    let (index, message_type, sequence, domain) = waiting.remove(position);
+                    self.collect(index, message_type, sequence, domain);
                 }
                 let destination = match transmit.destination {
                     Destination::Group => MacAddress(DESTINATION),
@@ -1108,8 +1161,9 @@ impl Daemon {
                         let now = self.now();
                         self.ports[index].remember(now, &transmit.frame, true, stamping);
                         if let Some((message_type, sequence)) = transmit.stamp {
-                            waiting.push((index, message_type, sequence));
+                            waiting.push((index, message_type, sequence, domain));
                             if message_type == MessageType::PdelayReq
+                                && domain == 0
                                 && let Some(end) = &mut self.end_station
                             {
                                 let now = self.started.elapsed();
@@ -1135,8 +1189,8 @@ impl Daemon {
                 if outgoing.stamp.is_some()
                     && let Some(position) = waiting.iter().position(|(each, ..)| *each == 0)
                 {
-                    let (index, message_type, sequence) = waiting.remove(position);
-                    self.collect(index, message_type, sequence);
+                    let (index, message_type, sequence, domain) = waiting.remove(position);
+                    self.collect(index, message_type, sequence, domain);
                 }
                 let port = &self.ports[0];
                 let destination = MacAddress(outgoing.destination);
@@ -1148,7 +1202,7 @@ impl Daemon {
                 match sent {
                     Ok(()) => {
                         if let Some((message_type, sequence)) = outgoing.stamp {
-                            waiting.push((0, message_type, sequence));
+                            waiting.push((0, message_type, sequence, 0));
                         }
                     }
                     Err(error) => {
@@ -1162,8 +1216,8 @@ impl Daemon {
             if waiting.is_empty() {
                 break;
             }
-            for (index, message_type, sequence) in waiting {
-                self.collect(index, message_type, sequence);
+            for (index, message_type, sequence, domain) in waiting {
+                self.collect(index, message_type, sequence, domain);
             }
         }
         let gone = std::mem::take(&mut self.gone);
@@ -1209,6 +1263,17 @@ impl Daemon {
             eprintln!("{}", self.describe(event));
         }
         while let Some(event) = self
+            .working_clock
+            .as_mut()
+            .and_then(|working| working.relay.poll_event())
+        {
+            if matches!(event, Event::DelayOutlier { .. }) {
+                continue;
+            }
+            self.changed = true;
+            eprintln!("working clock: {}", self.describe(event));
+        }
+        while let Some(event) = self
             .end_station
             .as_mut()
             .and_then(|end| end.lite.client.poll_event())
@@ -1238,6 +1303,9 @@ impl Daemon {
         self.changed = true;
         eprintln!("{}: down, {why}", port.name);
         self.relay.set_port(now, number(index), false);
+        if let Some(working) = &mut self.working_clock {
+            working.relay.set_port(now, number(index), false);
+        }
         if let Some(end) = &mut self.end_station {
             end.lite.set_link(now, false, None);
         }
@@ -1245,7 +1313,7 @@ impl Daemon {
 
     /// Gives the relay the time the event message last sent on port
     /// `index` left.
-    fn collect(&mut self, index: usize, message_type: MessageType, sequence: u16) {
+    fn collect(&mut self, index: usize, message_type: MessageType, sequence: u16, domain: u8) {
         let result = self.ports[index].socket.transmit_time(STAMP_WAIT);
         let now = self.now();
         let wire = result.as_ref().ok().copied().flatten();
@@ -1254,11 +1322,19 @@ impl Daemon {
         match result {
             Ok(Some(time)) => {
                 let time = self.clocks.stamp(index, time);
-                match (message_type, &mut self.end_station) {
-                    (MessageType::DelayReq, Some(end)) => {
+                match (message_type, &mut self.end_station, &mut self.working_clock) {
+                    (MessageType::DelayReq, Some(end), _) => {
                         end.lite
                             .client
                             .handle_transmit_time(message_type, sequence, time.port);
+                    }
+                    (_, _, Some(working)) if domain != 0 => {
+                        working.relay.handle_transmit_time(
+                            number(index),
+                            message_type,
+                            sequence,
+                            time,
+                        );
                     }
                     _ => {
                         self.relay
@@ -1400,6 +1476,9 @@ impl Daemon {
                 self.ports[0].up = false;
                 self.relay.set_port(now, 1, false);
                 end.lite.set_link(now, false, None);
+                if let Some(working) = &mut self.working_clock {
+                    working.relay.set_port(now, 1, false);
+                }
             }
             Err(error) => eprintln!("{}'s clock: {error}", self.ports[0].name),
         }
@@ -1422,6 +1501,17 @@ impl Daemon {
             eprintln!(
                 "{}: as grandmaster its time is drawn afresh on the reset clock, from the last \
                  line against CLOCK_MONOTONIC",
+                self.ports[0].name
+            );
+        }
+        if let Some(station) = self
+            .working_clock
+            .as_mut()
+            .and_then(|working| working.station.as_mut())
+            && let Err(error) = station.compare(self.clocks.local_clock(), self.clocks.steering())
+        {
+            eprintln!(
+                "{}'s clock, for the working clock: {error}",
                 self.ports[0].name
             );
         }
@@ -1515,6 +1605,57 @@ impl Daemon {
             line,
             asymmetry_included: false,
         }
+    }
+
+    /// The working clock's time, as [`Daemon::view`] has domain 0's.
+    fn working_view(&self) -> Option<View> {
+        let relay = &self.working_clock.as_ref()?.relay;
+        let ours = relay.is_grandmaster();
+        let line = if ours {
+            let local = self.clocks.now().unwrap_or_default();
+            relay
+                .grandmaster_time(local)
+                .zip(relay.rate_ratio())
+                .map(|(time, rate)| (local, time, rate))
+        } else {
+            relay.time_line()
+        };
+        Some(View {
+            // Following, the time counts before an Announce names whose.
+            grandmaster: relay
+                .grandmaster()
+                .map(|grandmaster| grandmaster.clock)
+                .or_else(|| line.map(|_| ClockIdentity(0))),
+            ours,
+            line,
+            asymmetry_included: false,
+        })
+    }
+
+    /// When the working clock last heard a Sync.
+    fn working_last_sync(&self) -> Option<i128> {
+        self.working_clock.as_ref()?.relay.last_sync()
+    }
+
+    /// Writes an end station's working clock mapping.
+    fn publish_working_clock(&mut self) {
+        let monotonic = raw_ether::clock::monotonic_now().as_nanos() as i64;
+        let Some(view) = self.working_view() else {
+            return;
+        };
+        let Some(station) = self
+            .working_clock
+            .as_mut()
+            .and_then(|working| working.station.as_mut())
+        else {
+            return;
+        };
+        let mapping = station.mapping(view, monotonic);
+        let recorded = self.clocks.recorded(mapping);
+        if let Err(error) = station.write(mapping, recorded) {
+            eprintln!("cannot write {}: {error}", station.path().display());
+        }
+        let _ = station.take_steadying();
     }
 
     /// When the profile running last heard a Sync, to publish at each.
@@ -1669,6 +1810,79 @@ fn record_grandmaster(path: &Path, grandmaster: ClockIdentity) -> std::io::Resul
     std::fs::rename(&partial, path)
 }
 
+/// The working clock on the ports whose files give them a role in it,
+/// an end station's own file or, on a bridge, each port's; none where no
+/// port has one.
+fn working_clock(
+    options: &Options,
+    ports: &[Port],
+    end_station: Option<&EndStation>,
+    identity: ClockIdentity,
+    clocks: &Clocks,
+) -> Result<Option<WorkingClock>, String> {
+    let roles: Vec<Option<gptp::relay::Role>> = match end_station {
+        Some(end) => vec![end.settings.working_clock],
+        None => ports
+            .iter()
+            .map(|port| {
+                config::load(&config::path(&port.name)).map_or_else(
+                    |error| {
+                        eprintln!("{error}; {} carries no working clock", port.name);
+                        None
+                    },
+                    |settings| settings.working_clock,
+                )
+            })
+            .collect(),
+    };
+    if roles.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let sync_interval = match (end_station, &options.bridge) {
+        (Some(end), _) => end.settings.working_clock_sync_interval,
+        (None, Some(bridge)) => config::load(&config::path(bridge))
+            .map_or(config::WORKING_CLOCK_SYNC_INTERVAL, |settings| {
+                settings.working_clock_sync_interval
+            }),
+        (None, None) => config::WORKING_CLOCK_SYNC_INTERVAL,
+    };
+    let mut working_config = Config::working_clock(identity, config::WORKING_CLOCK_DOMAIN);
+    working_config.log_sync_interval = sync_interval;
+    let mut relay = Relay::new(working_config, ports.len() as u16);
+    let mut carried = Vec::new();
+    for (index, (port, role)) in ports.iter().zip(&roles).enumerate() {
+        let Some(role) = role else {
+            continue;
+        };
+        // Its link is measured with Pdelay messages, which an 802.11 port
+        // does not carry.
+        if port.wireless {
+            eprintln!("{}: an 802.11 port carries no working clock", port.name);
+            continue;
+        }
+        relay.set_external_role(Duration::ZERO, number(index), *role);
+        carried.push(format!("{} its {}", port.name, status::role(*role)));
+    }
+    let station = match options.station() {
+        Some(interface) => Some(Station::open_domain(
+            interface,
+            config::WORKING_CLOCK_DOMAIN,
+            clocks.local_clock(),
+        )?),
+        None => None,
+    };
+    eprintln!(
+        "a working clock on domain {}, ARB time, a Sync every 2^{sync_interval} s: {}{}",
+        config::WORKING_CLOCK_DOMAIN,
+        carried.join(", "),
+        station
+            .as_ref()
+            .map(|station| format!("; its time in {}", station.path().display()))
+            .unwrap_or_default()
+    );
+    Ok(Some(WorkingClock { relay, station }))
+}
+
 fn run(options: Options) -> Result<(), String> {
     memory::lock();
     let status_path = options
@@ -1767,6 +1981,7 @@ fn run(options: Options) -> Result<(), String> {
             rhythm_minute: 0,
             rhythm_told: 0,
             rhythm_untold: 0,
+            last_received_working_clocks: false,
             wireless,
             ack_offset: i128::from(ack_offset),
             ftm_move_on,
@@ -1886,9 +2101,11 @@ fn run(options: Options) -> Result<(), String> {
             }
         }
     }
+    let working_clock = working_clock(&options, &ports, end_station.as_ref(), identity, &clocks)?;
     let mut daemon = Daemon {
         identity,
         relay,
+        working_clock,
         ports,
         clocks,
         bridge: options.bridge,
@@ -1919,6 +2136,7 @@ fn run(options: Options) -> Result<(), String> {
     let mut next_scan = SETTLE;
     let mut next_status = Duration::ZERO;
     let mut last_sync = None;
+    let mut working_last_sync = None;
     loop {
         let now = daemon.now();
         let mut publish = false;
@@ -1939,6 +2157,11 @@ fn run(options: Options) -> Result<(), String> {
         if daemon.relay.poll_timeout().is_some_and(|due| due <= now) {
             daemon.relay.handle_timeout(now);
         }
+        if let Some(working) = &mut daemon.working_clock
+            && working.relay.poll_timeout().is_some_and(|due| due <= now)
+        {
+            working.relay.handle_timeout(now);
+        }
         if let Some(end) = &mut daemon.end_station
             && end.lite.poll_timeout().is_some_and(|due| due <= now)
         {
@@ -1953,6 +2176,11 @@ fn run(options: Options) -> Result<(), String> {
             last_sync = synced;
             daemon.publish_station();
         }
+        let working_synced = daemon.working_last_sync();
+        if publish || working_synced != working_last_sync {
+            working_last_sync = working_synced;
+            daemon.publish_working_clock();
+        }
         let now = daemon.now();
         if daemon.changed || now >= next_status {
             if let Err(error) = status::write(&status_path, &status::text(&daemon)) {
@@ -1965,6 +2193,10 @@ fn run(options: Options) -> Result<(), String> {
             Some(next_compare),
             Some(next_scan),
             daemon.relay.poll_timeout(),
+            daemon
+                .working_clock
+                .as_ref()
+                .and_then(|working| working.relay.poll_timeout()),
             daemon
                 .end_station
                 .as_ref()
