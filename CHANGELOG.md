@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- gptp 0.3.0 on crates.io, with the working clock gptpd 0.2.4 runs:
+  `relay::Config` and `link::Config` gained fields (`domain`,
+  `ptp_timescale`, `external_port_configuration`, `major_sdo_id`), so a
+  struct literal names them or ends with `..Config::new(clock)` and
+  `..link::Config::default()`. raw-ether stays at 0.2.2.
+
 ## [0.2.4] - 2026-11-27
 
 gptpd 0.2.4's packages.
