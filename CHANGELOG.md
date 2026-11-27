@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-11-27
+
+gptpd 0.2.4's packages.
+
 - gptpd: `working-clock timetransmitter|timereceiver|passive` in a
   port's file runs domain 1, a working clock, beside domain 0: ARB time
   from the grandmaster's own oscillator, each port's role configured
@@ -9,7 +13,8 @@
   times a second and Sync 128 times a second
   (`working-clock-sync-interval`). An end station writes its time to
   `/run/gptpd/INTERFACE.d1.time`. Off by default; a port given no role
-  sends nothing of it.
+  sends nothing of it. Two systems simulated back to back lock within
+  32 ms of the link coming up; it has not yet run on hardware.
 - gptp: `relay::Config::working_clock` and `Relay::set_external_role`,
   externalPortConfigurationEnabled; `relay::Config`'s `domain`,
   `ptp_timescale` and `external_port_configuration`; `link::Config`'s
